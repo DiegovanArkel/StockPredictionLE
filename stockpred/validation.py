@@ -75,7 +75,7 @@ def purged_walk_forward(
     for start, end in blocks:
         test_months = unique_months[start:end]
         test_start = test_months[0]
-        cutoff = test_start - pd.DateOffset(months=embargo_months + 1)
+        cutoff = test_start - pd.offsets.MonthEnd(embargo_months + 1)
         train_months = unique_months[unique_months <= cutoff]
 
         if len(train_months) < min_train_months:
