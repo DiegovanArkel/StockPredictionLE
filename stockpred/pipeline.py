@@ -337,6 +337,7 @@ def run(
             history=oos_calibrated,
             failures=failures,
             staleness=staleness,
+            feature_importance=wf.feature_importance,
         )
 
     summary = {

@@ -76,6 +76,19 @@ def run_backtest(oos_calibrated: pd.DataFrame, cfg: Any) -> dict:
       negative, capital-compounding cost -- not a free flat month); only a
       cash -> cash transition is truly ``ret == cost_eur == 0.0``.
 
+    - **Terminal liquidation.** If the backtest ends while still holding
+      positions, closing them is charged too: ``final_capital`` is
+      cash-equivalent, not paper. The exit is priced against the notional
+      actually sold -- the end-of-period capital split over the closing
+      holdings -- and booked into the **last month's** ``cost_eur``, with
+      the last month's ``ret`` reduced by ``exit_cost /
+      capital_at_start_of_last_month``. Expressing it as a drag on that
+      month's starting capital keeps ``final_capital`` exactly equal to
+      ``10_000 * (1 + total_return)`` and keeps the ``monthly_returns``
+      series self-consistent (compounding it reproduces the equity curve).
+      The closing positions count toward ``n_trades`` as exits. A backtest
+      that ends in cash is unaffected.
+
     **Outputs** -- returns a dict of native Python types only (every value
     round-trips through ``json.dumps``):
 
@@ -110,6 +123,8 @@ def run_backtest(oos_calibrated: pd.DataFrame, cfg: Any) -> dict:
     capital = _INITIAL_CAPITAL
     prev_holdings: set = set()
     n_trades = 0
+    last_month_start_capital = _INITIAL_CAPITAL
+    last_fold: int | None = None
 
     monthly_returns: list[dict] = []
     benchmark_returns: list[float] = []
@@ -162,6 +177,8 @@ def run_backtest(oos_calibrated: pd.DataFrame, cfg: Any) -> dict:
         ret = gross_ret - cost_eur / capital
         prev_holdings = selected_tickers
 
+        last_month_start_capital = capital
+        last_fold = fold
         capital = capital * (1.0 + ret)
 
         monthly_returns.append(
@@ -174,6 +191,28 @@ def run_backtest(oos_calibrated: pd.DataFrame, cfg: Any) -> dict:
             }
         )
         per_fold_returns[fold].append(ret)
+
+    # --- Terminal liquidation -------------------------------------------
+    # The backtest ends holding positions, and those positions are not free
+    # to be rid of: an investor comparing this to a benchmark can only spend
+    # cash. Charge the exit cost of everything still held at the end,
+    # priced against the final capital split over the closing holdings --
+    # the notional actually being sold. Booked into the LAST month (it
+    # happens at that month's close), expressed as a return drag relative
+    # to that month's starting capital so the reported monthly return
+    # series still compounds exactly to `final_capital`.
+    if prev_holdings and monthly_returns:
+        notional_final = capital / len(prev_holdings)
+        exit_cost = len(prev_holdings) * (
+            notional_final * cfg.cost_bps / 1e4 + cfg.cost_fixed_eur
+        )
+        n_trades += len(prev_holdings)
+        capital -= exit_cost
+        drag = exit_cost / last_month_start_capital
+        monthly_returns[-1]["ret"] = float(monthly_returns[-1]["ret"] - drag)
+        monthly_returns[-1]["cost_eur"] = float(monthly_returns[-1]["cost_eur"] + exit_cost)
+        if last_fold is not None:
+            per_fold_returns[last_fold][-1] -= drag
 
     net_returns = np.array([m["ret"] for m in monthly_returns], dtype=float)
     n_months = len(net_returns)

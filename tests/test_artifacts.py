@@ -491,3 +491,57 @@ class TestLoadArtifactsMissingAndCorrupt:
 
         with pytest.raises(Exception):  # noqa: B017 - pyarrow's own exception type
             load_artifacts(tmp_path)
+
+
+class TestFeatureImportancePersistence:
+    """Review fix #7: walk-forward feature importance was computed and then
+    thrown away. It must reach diagnostics.json when supplied, and the key
+    must stay absent (not null) when it isn't, so older artifacts and the
+    dashboard's "if present" render path both stay valid.
+    """
+
+    def _importance(self) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "feature": ["mom_12_1", "vol_12m", "F1"],
+                "importance": [np.float64(310.5), np.float32(120.0), 7],
+            }
+        )
+
+    def _write(self, tmp_path, feature_importance):
+        kwargs = dict(
+            forecasts=_forecasts(),
+            wf_metrics=_wf_metrics(),
+            offsets=_offsets(),
+            backtest_summary=_backtest_summary(),
+            history=_history(),
+            failures=[],
+            staleness={},
+        )
+        if feature_importance is not None:
+            kwargs["feature_importance"] = feature_importance
+        write_artifacts(tmp_path, **kwargs)
+        with open(tmp_path / "diagnostics.json") as f:
+            return json.load(f)
+
+    def test_written_as_native_json_records_in_order(self, tmp_path):
+        diagnostics = self._write(tmp_path, self._importance())
+
+        assert diagnostics["feature_importance"] == [
+            {"feature": "mom_12_1", "importance": 310.5},
+            {"feature": "vol_12m", "importance": 120.0},
+            {"feature": "F1", "importance": 7.0},
+        ]
+        # Native Python types only -- no numpy leakage through json.
+        for record in diagnostics["feature_importance"]:
+            assert type(record["feature"]) is str
+            assert type(record["importance"]) is float
+
+    def test_key_omitted_when_not_supplied(self, tmp_path):
+        diagnostics = self._write(tmp_path, None)
+        assert "feature_importance" not in diagnostics
+        assert "wf_metrics" in diagnostics  # everything else still written
+
+    def test_key_omitted_for_an_empty_frame(self, tmp_path):
+        diagnostics = self._write(tmp_path, pd.DataFrame(columns=["feature", "importance"]))
+        assert "feature_importance" not in diagnostics

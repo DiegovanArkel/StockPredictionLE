@@ -22,6 +22,7 @@ from stockpred.models.workhorse import (
     STOCK_FEATURE_COLS,
     WalkForwardResult,
     WorkhorseModel,
+    _quantile_col,
     run_walk_forward,
 )
 
@@ -195,6 +196,17 @@ class TestRunWalkForward:
         assert set(fi["feature"]) == set(FEATURE_COLS)
         # sorted descending by importance
         assert (fi["importance"].diff().dropna() <= 0).all()
+
+    def test_quantile_col_names_use_round_not_truncation(self):
+        # 0.29 * 100 == 28.999999999999996 in binary floating point; int()
+        # would truncate that to "q28". Every supported level must map to
+        # its exact two-digit name.
+        assert _quantile_col(0.05) == "q05"
+        assert _quantile_col(0.25) == "q25"
+        assert _quantile_col(0.5) == "q50"
+        assert _quantile_col(0.75) == "q75"
+        assert _quantile_col(0.95) == "q95"
+        assert _quantile_col(0.29) == "q29"
 
     def test_feature_cols_constant(self):
         assert FEATURE_COLS == STOCK_FEATURE_COLS + ["F1", "F2", "F3", "F4", "F5"]

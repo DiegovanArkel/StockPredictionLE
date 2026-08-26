@@ -34,6 +34,15 @@ _MOM_12_1_WINDOW = 11  # months t-11..t-1, excluding month t
 _BETA_WINDOW = 36
 _BETA_MIN_PERIODS = 12
 
+# Panel-edge hygiene: how many calendar days before its month-end a ticker's
+# last daily observation may fall before that trailing month is treated as
+# still in progress (and dropped). 2 days exactly absorbs a month that ends
+# on a weekend -- for every month-end weekday, the preceding Friday is never
+# more than 2 calendar days earlier -- while still catching a month whose
+# data stops with a week or more of trading left. See
+# `_drop_incomplete_trailing_month`.
+_TRAILING_MONTH_TOLERANCE_DAYS = 2
+
 _OUTPUT_COLUMNS = [
     "ticker",
     "date",
@@ -80,6 +89,15 @@ def build_monthly_panel(
     ``fwd_ret_1m`` target (``ret_1m`` shifted -1 within ticker). Rows with a
     missing target are dropped unless ``drop_missing_target=False``; feature
     NaNs are always kept.
+
+    Panel-edge hygiene
+    ------------------
+    A ticker's trailing month is dropped entirely when the data stops
+    mid-month (see :func:`_drop_incomplete_trailing_month`), so an
+    in-progress month is never presented as a completed one -- neither as a
+    feature row the production forecast predicts from, nor as the previous
+    month's ``fwd_ret_1m`` target. With ``drop_missing_target=False``, the
+    latest row per ticker is therefore the latest *complete* month.
     """
     daily = _prepare_daily(prices)
     mkt_rf = factors.set_index("date")["mkt_rf"]
@@ -88,6 +106,11 @@ def build_monthly_panel(
     for ticker, ticker_daily in daily.groupby("ticker", sort=False):
         ticker_daily = ticker_daily.sort_values("date")
         monthly = _monthly_aggregate(ticker_daily)
+        monthly = _drop_incomplete_trailing_month(monthly, ticker_daily["date"].max())
+        if monthly.empty:
+            # The ticker's only month was an in-progress one -- nothing
+            # trustworthy to build a row from.
+            continue
         monthly = _reindex_full_calendar(monthly)
         monthly = _finalize_price_derived_columns(monthly)
         monthly = _add_momentum(monthly)
@@ -96,6 +119,9 @@ def build_monthly_panel(
         monthly["ticker"] = ticker
         monthly["fwd_ret_1m"] = monthly["ret_1m"].shift(-1)
         ticker_frames.append(monthly)
+
+    if not ticker_frames:
+        return pd.DataFrame(columns=_OUTPUT_COLUMNS)
 
     panel = pd.concat(ticker_frames, ignore_index=True)
     # Drop calendar months that were inserted by _reindex_full_calendar
@@ -142,6 +168,61 @@ def _monthly_aggregate(ticker_daily: pd.DataFrame) -> pd.DataFrame:
         .reset_index(drop=True)
     )
     return monthly
+
+
+def _drop_incomplete_trailing_month(
+    monthly: pd.DataFrame, last_daily_date: pd.Timestamp
+) -> pd.DataFrame:
+    """Drop the ticker's trailing month row when that month is still in
+    progress at the edge of the data.
+
+    ``_monthly_aggregate`` collapses whatever daily rows exist in a month
+    into one row, with no notion of whether the month actually *finished*.
+    At the panel's edge that silently manufactures a full-looking row out of
+    a partial month: on the real run, ASML's ``2026-08`` row was built from
+    18 trading days, giving an off-distribution ``mom_1m`` (a partial-month
+    return presented as a full-month one) and an under-sampled ``vol_1m``.
+    The production forecast then predicts from exactly that row, and the
+    *previous* month's ``fwd_ret_1m`` target would be that same partial
+    return.
+
+    **Rule (one rule, applied only to the trailing month):** the last
+    calendar month present is dropped when the ticker's last daily
+    observation falls more than ``_TRAILING_MONTH_TOLERANCE_DAYS`` (2)
+    calendar days before that month's month-end date -- i.e. before the
+    3rd-to-last calendar day of the month. A completed month always has a
+    trading day on its month-end or, when the month ends on a weekend, on
+    the Friday at most 2 calendar days earlier, so a completed month is
+    never dropped. An in-progress month (or one whose feed stopped
+    mid-month) is.
+
+    The count-based alternative ("drop when the month has fewer than 15
+    trading observations") was considered and rejected: it also fires on
+    genuinely complete but short/holiday-shortened months and on trading
+    halts, whereas the date-based rule answers the actual question -- did
+    this month finish? -- directly. A false positive here is cheap and
+    conservative: the production forecast simply comes from the last
+    *complete* month instead.
+
+    This runs before calendar reindexing and before the ``fwd_ret_1m``
+    shift, so a partial trailing month never becomes any other month's
+    target either.
+
+    NOTE: this addresses the trailing edge only. It does not affect the
+    separately-deferred mid-series issue where the first daily return after
+    a multi-week gap is one compressed pseudo-daily return that pollutes
+    that month's ``vol_*`` (see the Task 3 report) -- that is a different
+    month, in the middle of the series, and is out of scope here.
+    """
+    if monthly.empty or pd.isna(last_daily_date):
+        return monthly
+
+    last_month_end = pd.Timestamp(last_daily_date) + pd.offsets.MonthEnd(0)
+    cutoff = last_month_end - pd.Timedelta(days=_TRAILING_MONTH_TOLERANCE_DAYS)
+    if pd.Timestamp(last_daily_date) >= cutoff:
+        return monthly
+
+    return monthly[monthly["date"] != last_month_end].reset_index(drop=True)
 
 
 def _reindex_full_calendar(monthly: pd.DataFrame) -> pd.DataFrame:

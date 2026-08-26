@@ -14,6 +14,13 @@ adding it to both interval bounds. This keeps the finite-sample marginal
 coverage guarantee (under exchangeability) without touching the model
 itself.
 
+``calibrate_from_wf`` computes those offsets **per fold** -- fold ``k``'s
+offsets come from fold ``k``'s own calibration rows, which strictly precede
+fold ``k``'s test months -- so no reported interval is ever a function of
+residuals observed after the month it is applied to. See that function's
+docstring for why the older pooled-across-folds version was a look-ahead
+leak.
+
 All three functions here operate on returns as decimal fractions, matching
 the rest of the codebase.
 """
@@ -112,37 +119,102 @@ def apply_cqr(pred: pd.DataFrame, offsets: dict) -> pd.DataFrame:
 
 
 def calibrate_from_wf(wf: "WalkForwardResult") -> tuple[dict, pd.DataFrame]:
-    """Compute CQR offsets from a walk-forward result's pooled ``cal`` set
-    and apply them to its ``oos`` predictions.
+    """Calibrate a walk-forward result's ``oos`` predictions **per fold**,
+    each fold using only its own ``cal`` rows.
 
-    All folds' ``cal`` rows are pooled into a single calibration set (one
-    offsets dict for the (q05, q95) pair at alpha=0.10 and one for the
-    (q25, q75) pair at alpha=0.50) -- no leakage, since ``cal`` is disjoint
-    from ``oos`` and was produced by models never fit on ``oos`` months
-    (see the module docstring in :mod:`stockpred.models.workhorse`).
+    Why per fold (and why pooling would be a look-ahead leak)
+    ----------------------------------------------------------
+    An earlier version of this function pooled every fold's ``cal`` rows
+    into one calibration set and applied the resulting scalar offsets to
+    every fold's ``oos`` rows. The argument given for that being leak-free
+    was *model disjointness*: no ``cal`` row was ever used to fit the model
+    that produced the ``oos`` predictions. That argument is wrong, because
+    model disjointness is not temporal disjointness. The pooled ``cal`` set
+    spans the whole sample, so the offset applied to fold 0's 2018 test
+    months was computed partly from calibration residuals observed in 2023-
+    2025 -- information that did not exist in 2018. The interval widths (and
+    therefore the ``q05_cal`` gate that drives the backtest's position
+    selection) were then a function of the future. Measured on the real
+    run, that inflated the reported backtest materially.
 
-    Returns ``(offsets, oos_calibrated)`` where ``offsets`` is
-    ``{"90": float, "50": float, "coverage_raw_90": float,
-    "coverage_cal_90": float}`` -- the last two being the empirical
-    fraction of ``oos`` rows with ``y_true`` inside ``[q05, q95]`` before
-    and after calibration, respectively -- and ``oos_calibrated`` is
-    ``wf.oos`` with the four ``*_cal`` columns added (see ``apply_cqr``).
+    So: fold ``k``'s offsets come from fold ``k``'s own ``cal`` rows only,
+    which are the trailing ``CAL_MONTHS`` of fold ``k``'s *training* block
+    and therefore strictly precede fold ``k``'s test block (the walk-forward
+    harness embargoes the gap between them -- see
+    :func:`stockpred.validation.purged_walk_forward`). Every fold's
+    calibration set is far larger than ``_MIN_CAL_N`` in practice (450+ rows
+    on the real panel), so nothing is lost in statistical precision.
+
+    Returns ``(offsets, oos_calibrated)``.
+
+    ``offsets`` is::
+
+        {"90": float,            # POOLED offset -- diagnostic display only
+         "50": float,            # POOLED offset -- diagnostic display only
+         "per_fold": {"0": {"90": float, "50": float}, "1": {...}, ...},
+         "coverage_raw_90": float,
+         "coverage_cal_90": float}
+
+    The top-level ``"90"``/``"50"`` values are the *pooled* offsets, kept
+    only as a whole-sample summary statistic for ``diagnostics.json`` and
+    the dashboard's "conformal calibration offsets" line. **Nothing in the
+    pipeline calibrates anything with them**: the reported ``oos`` intervals
+    here use ``per_fold``, and the shipped production forecast computes its
+    own offsets from its own trailing calibration block (see
+    :func:`stockpred.pipeline._production_forecast`). They are a summary,
+    not an input.
+
+    ``per_fold`` is keyed by the fold id as a string, so the dict round-
+    trips through JSON unchanged.
+
+    ``coverage_raw_90``/``coverage_cal_90`` are the empirical fraction of
+    ``oos`` rows whose ``y_true`` falls inside ``[q05, q95]`` and
+    ``[q05_cal, q95_cal]`` respectively -- both computed on the
+    per-fold-calibrated frame, so the calibrated figure is an honest
+    out-of-sample coverage number.
+
+    ``oos_calibrated`` is ``wf.oos`` with the four ``*_cal`` columns added
+    (see ``apply_cqr``), in ``wf.oos``'s original row order.
     """
     cal = wf.cal
-    offset_90 = cqr_offsets(cal["q05"], cal["q95"], cal["y_true"], alpha=0.10)
-    offset_50 = cqr_offsets(cal["q25"], cal["q75"], cal["y_true"], alpha=0.50)
-    offsets: dict = {"90": offset_90, "50": offset_50}
+    oos = wf.oos
 
-    oos_calibrated = apply_cqr(wf.oos, offsets)
+    # Pooled offsets: reported as a summary statistic only (see docstring).
+    pooled: dict = {
+        "90": cqr_offsets(cal["q05"], cal["q95"], cal["y_true"], alpha=0.10),
+        "50": cqr_offsets(cal["q25"], cal["q75"], cal["y_true"], alpha=0.50),
+    }
 
-    y_true = wf.oos["y_true"]
-    coverage_raw_90 = float(((wf.oos["q05"] <= y_true) & (y_true <= wf.oos["q95"])).mean())
-    coverage_cal_90 = float(
-        (
-            (oos_calibrated["q05_cal"] <= y_true) & (y_true <= oos_calibrated["q95_cal"])
-        ).mean()
+    per_fold: dict[str, dict[str, float]] = {}
+    calibrated_parts: list[pd.DataFrame] = []
+
+    for fold_id in sorted(oos["fold"].unique()):
+        fold_cal = cal[cal["fold"] == fold_id]
+        fold_oos = oos[oos["fold"] == fold_id]
+        if fold_cal.empty:
+            raise ValueError(
+                f"calibrate_from_wf: fold {fold_id} has oos rows but no cal "
+                "rows -- cannot compute an honest per-fold offset for it"
+            )
+        fold_offsets = {
+            "90": cqr_offsets(fold_cal["q05"], fold_cal["q95"], fold_cal["y_true"], alpha=0.10),
+            "50": cqr_offsets(fold_cal["q25"], fold_cal["q75"], fold_cal["y_true"], alpha=0.50),
+        }
+        per_fold[str(fold_id)] = fold_offsets
+        calibrated_parts.append(apply_cqr(fold_oos, fold_offsets))
+
+    # Reassemble in the input's original row order (each part kept wf.oos's
+    # own index labels, which are unique).
+    oos_calibrated = pd.concat(calibrated_parts).reindex(oos.index)
+
+    y_true = oos_calibrated["y_true"]
+    offsets: dict = dict(pooled)
+    offsets["per_fold"] = per_fold
+    offsets["coverage_raw_90"] = float(
+        ((oos_calibrated["q05"] <= y_true) & (y_true <= oos_calibrated["q95"])).mean()
     )
-    offsets["coverage_raw_90"] = coverage_raw_90
-    offsets["coverage_cal_90"] = coverage_cal_90
+    offsets["coverage_cal_90"] = float(
+        ((oos_calibrated["q05_cal"] <= y_true) & (y_true <= oos_calibrated["q95_cal"])).mean()
+    )
 
     return offsets, oos_calibrated

@@ -83,7 +83,13 @@ _SEED = 0
 
 
 def _quantile_col(q: float) -> str:
-    return f"q{int(q * 100):02d}"
+    """Column name for quantile level ``q`` (e.g. 0.05 -> ``"q05"``).
+
+    ``round`` rather than ``int``: ``0.29 * 100`` is ``28.999999999999996``
+    in binary floating point, which ``int()`` truncates to 28. Every
+    supported level is exact under ``round``.
+    """
+    return f"q{int(round(q * 100)):02d}"
 
 
 def _macro_factor_cols(n_factors: int) -> list[str]:
@@ -186,8 +192,6 @@ def run_walk_forward(
 
     total_sse_q50 = 0.0
     total_sse_bench = 0.0
-
-    dates_arr = panel["date"].to_numpy()
 
     folds = purged_walk_forward(
         panel["date"],

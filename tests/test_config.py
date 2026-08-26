@@ -123,3 +123,36 @@ def test_load_config_string_path_argument_default(monkeypatch):
     config = load_config("config.yaml")
     assert isinstance(config, Config)
     assert len(config.tickers) == 24
+
+
+_MINIMAL_KEYS = """
+tickers: [ASML]
+fred_series: [INDPRO]
+ecb_series: []
+data_dir: data
+artifacts_dir: artifacts
+duckdb_path: data/stockpred.duckdb
+"""
+
+
+def test_load_config_explicit_supported_quantiles_accepted(tmp_path):
+    yaml_path = tmp_path / "quantiles_ok.yaml"
+    yaml_path.write_text(_MINIMAL_KEYS + "quantiles: [0.05, 0.25, 0.5, 0.75, 0.95]\n")
+    config = load_config(yaml_path)
+    assert config.quantiles == [0.05, 0.25, 0.5, 0.75, 0.95]
+
+
+@pytest.mark.parametrize(
+    "quantiles",
+    [
+        "[0.1, 0.5, 0.9]",  # different family entirely
+        "[0.05, 0.25, 0.5, 0.75]",  # missing a level
+        "[0.05, 0.25, 0.5, 0.75, 0.95, 0.99]",  # extra level
+        "[0.95, 0.75, 0.5, 0.25, 0.05]",  # right levels, wrong order
+    ],
+)
+def test_load_config_unsupported_quantiles_raise_with_clear_message(tmp_path, quantiles):
+    yaml_path = tmp_path / "quantiles_bad.yaml"
+    yaml_path.write_text(_MINIMAL_KEYS + f"quantiles: {quantiles}\n")
+    with pytest.raises(ValueError, match="Unsupported 'quantiles'"):
+        load_config(yaml_path)

@@ -110,9 +110,15 @@ whatever is already cached.
    simulated forward for volatility and return-quantile bands; Conformalized
    Quantile Regression (`stockpred/models/conformal.py`, split-conformal on
    a held-out calibration window) widens or shrinks the LightGBM quantile
-   bands so their empirical coverage matches their nominal level.
+   bands so their empirical coverage matches their nominal level. The CQR
+   offsets are computed **per walk-forward fold** from that fold's own
+   calibration months, which strictly precede its test months — pooling
+   them across folds would let residuals from 2025 set the interval widths
+   used to score 2018 (see the snapshot section for what that was worth).
 5. **Backtest** (`stockpred/backtest.py`) — a simple long/cash monthly
-   threshold rule, DEGIRO-like trading costs, and the **Deflated Sharpe
+   threshold rule, DEGIRO-like trading costs (including the cost of
+   liquidating whatever is still held on the final month, so
+   `final_capital` is cash rather than paper), and the **Deflated Sharpe
    Ratio** (Bailey & López de Prado 2014), which discounts the raw Sharpe
    ratio for the number of strategy variants effectively trialed across
    walk-forward folds — the honest way to ask "is this luck?"
@@ -126,8 +132,8 @@ whatever is already cached.
    lightweight enough for Streamlit Community Cloud. Three pages:
    per-stock fan charts (Plotly) with a 12-month "humble" scenario band,
    a diagnostics page (R² by fold, coverage before/after calibration,
-   pinball loss), and a backtest page (equity curve, Sharpe/PSR/DSR,
-   drawdown, trade log).
+   pinball loss, feature importance, per-fold conformal offsets), and a
+   backtest page (equity curve, Sharpe/PSR/DSR, drawdown, trade log).
 
 ## Provider notes
 
@@ -159,10 +165,15 @@ whatever is already cached.
    on a paid plan).
 2. The weekly cron in `.github/workflows/weekly.yml` runs every Monday at
    06:00 UTC (`workflow_dispatch` also lets you trigger it manually from
-   the Actions tab). It installs the package, runs
-   `python -m stockpred run`, and commits any changed files under
-   `artifacts/` back to the repo as `github-actions[bot]`. No secrets are
-   required — every provider used here is keyless.
+   the Actions tab). It restores the previous run's `data/raw` parquet
+   cache (`actions/cache`, so `cached_fetch`'s fall-back-to-last-good-
+   snapshot path is actually reachable on a fresh runner and a provider
+   flake doesn't fail the run), installs the package, runs the test suite
+   as a fail-fast gate, runs `python -m stockpred run`, and commits any
+   changed files under `artifacts/` back to the repo as
+   `github-actions[bot]`. The job is capped at 90 minutes and a
+   `concurrency` group keeps two refreshes from racing onto the same
+   branch. No secrets are required — every provider used here is keyless.
 3. On [Streamlit Community Cloud](https://streamlit.io/cloud), create a
    new app pointing at this repo, branch `main` (or whichever branch you
    deploy from), and entrypoint `app/streamlit_app.py`. Streamlit Cloud
@@ -179,24 +190,62 @@ whatever is already cached.
    the schedule and you'll need to manually re-enable it from the Actions
    tab.
 
-## Results snapshot (first real-data run, 2026-08-26)
+## Results snapshot (real-data run, 2026-08-27)
 
-From the first full run against real providers (24 AEX tickers, 2000–2026
-daily prices, 14 macro series, walk-forward LightGBM + CQR + GJR-GARCH):
+From a full run against real providers (24 AEX tickers, 2000–2026 daily
+prices, 14 macro series, walk-forward LightGBM + CQR + GJR-GARCH). OOS
+window: 96 months, 2018-07 through 2026-06, 2,146 forecast rows.
 
 | Metric | Value | Note |
 |---|---|---|
 | Tickers fetched / failed | 24 / 0 | all resolve after TKWY's removal |
-| Pooled OOS R² (median forecast vs historical-mean benchmark) | −3.7% | negative, i.e. *below* the naive benchmark; per-fold range −22.6% to +9.6% — consistent with "no detectable edge," not leakage (leakage would show up as R² well above zero, not below it) |
-| Raw 90% interval coverage (pre-calibration) | 76.7% | under-covers, as expected for an uncalibrated quantile regressor |
-| Calibrated 90% interval coverage (post-CQR) | 89.6% | inside the 87–93% target band |
-| Backtest: annualized return / vol / Sharpe | 0.75% / 11.3% / 0.12 | net of DEGIRO-like costs |
-| Backtest: PSR / DSR | 0.63 / 0.13 | DSR (deflated for 8 walk-forward-fold trials) does *not* support a genuine-skill claim |
-| Buy-and-hold benchmark total return (same period) | +205% | the strategy's conservative long/cash rule captures very little of the AEX's 2018–2026 bull run — an honest cost of caution, not a bug |
+| Pooled OOS R² (median forecast vs historical-mean benchmark) | −4.8% | negative, i.e. *below* the naive benchmark; per-fold range −40.1% to +8.8% — consistent with "no detectable edge," not leakage (leakage would show up as R² well above zero, not below it) |
+| Raw 90% interval coverage (pre-calibration) | 77.5% | under-covers, as expected for an uncalibrated quantile regressor |
+| Calibrated 90% interval coverage (post-CQR, per fold) | 89.7% | inside the 87–93% target band |
+| Backtest: total return over 96 months | +29.0% | net of DEGIRO-like costs, including liquidating the final holdings |
+| Backtest: annualized return / vol / Sharpe | 3.23% / 10.30% / 0.36 | |
+| Backtest: PSR / DSR | 0.84 / 0.32 | DSR (deflated for 8 walk-forward-fold trials) does *not* support a genuine-skill claim |
+| Backtest: max drawdown / trades | −19.2% / 302 | |
+| Buy-and-hold benchmark total return (same period) | +199% | the strategy's conservative long/cash rule captures very little of the AEX's 2018–2026 bull run — an honest cost of caution, not a bug |
 
-Full per-fold breakdowns, pinball loss, monthly-return series, and stage
-timings are in
-`.superpowers/sdd/2026-08-26-stock-prediction-system/task-12-report.md`.
+### These numbers are not comparable to the ones published on 2026-08-26
+
+Two corrections landed between the two runs, and **the earlier snapshot
+should be treated as withdrawn rather than as a baseline**:
+
+1. **Conformal calibration is now per fold, not pooled.** Previously one
+   scalar CQR offset was computed from *every* fold's calibration residuals
+   and applied to *every* fold's out-of-sample months — so the interval
+   widths used to score 2018 were partly a function of residuals observed
+   in 2023–2025. Since the backtest's position filter gates on the
+   calibrated lower bound `q05_cal`, that fed the future straight into the
+   reported strategy. Measured on the *identical* walk-forward output, the
+   difference is large:
+
+   | | per fold (honest, shipped) | pooled (the old, leaky scheme) |
+   |---|---|---|
+   | Total return | +29.0% | +84.3% |
+   | Sharpe | 0.36 | 0.68 |
+   | DSR | 0.32 | 0.66 |
+   | Avg. positions held / month | 2.33 | 2.65 |
+
+   Roughly two-thirds of the pooled backtest's return was an artifact of
+   look-ahead. Coverage barely moves (89.7% vs 89.6%), which is exactly
+   why the leak was easy to miss — the calibration *looked* fine.
+
+2. **The panel's trailing partial month is now dropped.** On 2026-08-26 all
+   24 tickers had an in-progress August row built from 18 trading days,
+   aggregated as if it were a complete month. Dropping it moves the whole
+   walk-forward window back by one month (OOS now ends 2026-06 rather than
+   2026-07), which shifts every fold boundary. So the headline backtest
+   figure changed for *two* reasons at once, and the honest apples-to-apples
+   measurement of the leak's size is the table above, not the difference
+   between the two published snapshots.
+
+Full per-fold breakdowns, pinball loss, per-fold conformal offsets,
+monthly-return series, and stage timings are in
+`.superpowers/sdd/2026-08-26-stock-prediction-system/final-fix-report.md`
+(and the superseded first run in `task-12-report.md`).
 
 ## Real-data findings (Task 12)
 
@@ -220,9 +269,52 @@ re-running this pipeline against fresh data:
   new `min_date` parameter, wired up in `stockpred/pipeline.py`) — see
   the full metrics dump in the task report for which series survive after
   the fix.
+- **The panel's last month is usually in progress.** yfinance returns data
+  through *today*, so on any day that isn't a month end the most recent
+  month aggregates to a full-looking row built from a partial month —
+  giving an off-distribution `mom_1m` (a part-month return presented as a
+  full one) and an under-sampled `vol_1m`. `build_monthly_panel` now drops
+  a ticker's trailing month when its last daily observation falls more than
+  2 calendar days before that month's month-end (see
+  `stockpred/features/stock.py`), so the production forecast always
+  predicts from the last *complete* month and no complete month's
+  `fwd_ret_1m` target is ever a partial-month return.
 - Full metrics (R² per fold, coverage, pinball loss, backtest DSR/PSR,
   stage timings, ticker fetch results) are in
-  `.superpowers/sdd/2026-08-26-stock-prediction-system/task-12-report.md`.
+  `.superpowers/sdd/2026-08-26-stock-prediction-system/task-12-report.md`
+  (first run) and `final-fix-report.md` (current run).
+
+## Known limitations
+
+Things that are deliberately accepted rather than fixed, recorded here so
+nobody has to rediscover them:
+
+- **The macro column filter is a full-sample statistic.**
+  `build_macro_wide` drops macro series that are more than 30% missing, and
+  it is called **once**, on the whole macro history, before any
+  walk-forward split. Which columns survive is therefore decided using the
+  NaN pattern of the entire sample — including months that later land in
+  test folds — and that decision reaches every fold's features. This is
+  accepted because only the *availability pattern* (`isna()`) crosses the
+  boundary, never a value: no test-month observation influences any number
+  a model is fit on, and the transforms, standardization stats and PCA
+  components are all still fit per fold on train months only
+  (`MacroFactorExtractor`). What is being read is a publication-calendar
+  fact about FRED/ECB series — when each one starts and how often it is
+  published — not a property of the returns being predicted, so it carries
+  no information about the future. The alternative (recomputing the
+  surviving column set per fold) would make the feature matrix's *columns*
+  vary by fold, which the fixed `F1..Fn` factor contract downstream does
+  not support. Called out in `build_macro_wide`'s docstring too.
+- **A gap in a ticker's daily data still contaminates that month's
+  volatility.** After a multi-week gap, the first daily return is computed
+  across the whole gap and lands in one month's pooled return statistics as
+  a single huge pseudo-daily observation, inflating `vol_1m` (and any
+  `vol_3m`/`vol_12m` window containing it) for the month *after* the gap.
+  Momentum, `ret_1m` and the target are already correct across gaps (see
+  `_reindex_full_calendar`); this affects the volatility features only, and
+  is a separate issue from the trailing-partial-month fix above. See the
+  Task 3 report for the analysis.
 
 ## Caveats
 

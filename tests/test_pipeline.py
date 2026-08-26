@@ -187,6 +187,21 @@ class TestPipelineRun:
         assert "wf_metrics" in diagnostics
         assert "offsets" in diagnostics
 
+        # Per-fold conformal offsets: one entry per fold that produced OOS
+        # rows, keyed by fold id as a JSON-safe string.
+        per_fold = diagnostics["offsets"]["per_fold"]
+        assert set(per_fold) == {str(f) for f in sorted(history["fold"].unique())}
+        for fold_offsets in per_fold.values():
+            assert set(fold_offsets) == {"90", "50"}
+            assert all(isinstance(v, float) for v in fold_offsets.values())
+
+        # Feature importance is persisted rather than computed and dropped.
+        importance = diagnostics["feature_importance"]
+        assert isinstance(importance, list) and importance
+        assert set(importance[0]) == {"feature", "importance"}
+        importances = [r["importance"] for r in importance]
+        assert importances == sorted(importances, reverse=True)
+
         expected_stages = {
             "refresh_duckdb",
             "load_data",

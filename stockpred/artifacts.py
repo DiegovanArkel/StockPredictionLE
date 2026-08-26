@@ -221,15 +221,25 @@ def write_artifacts(
     history: pd.DataFrame,
     failures: list,
     staleness: dict,
+    feature_importance: pd.DataFrame | None = None,
 ) -> None:
     """Write the dashboard's entire input surface to ``artifacts_dir``.
 
     Writes ``forecasts.parquet`` (``forecasts`` as-is), ``oos_history.parquet``
     (``history`` as-is -- calibrated OOS predictions + y_true, for the
     diagnostics page), ``backtest.json`` (``backtest_summary`` as-is),
-    ``diagnostics.json`` (``{"wf_metrics": wf_metrics, "offsets": offsets}``),
-    and ``manifest.json`` (generation timestamp, row counts, failed tickers,
-    stale sources, and package versions).
+    ``diagnostics.json`` (``{"wf_metrics": wf_metrics, "offsets": offsets}``,
+    plus ``"feature_importance"`` when supplied), and ``manifest.json``
+    (generation timestamp, row counts, failed tickers, stale sources, and
+    package versions).
+
+    ``feature_importance`` is the ``[feature, importance]`` frame from
+    :class:`stockpred.models.workhorse.WalkForwardResult` (mean gain-based
+    importance of the q50 model across folds). When given, it is serialized
+    into ``diagnostics.json`` as ``[{"feature": str, "importance": float},
+    ...]``, ordered as passed in; when ``None`` the key is omitted entirely
+    so older artifacts stay valid and the dashboard's "if present" render
+    path is the only thing that has to care.
 
     Creates ``artifacts_dir`` (and parents) if it doesn't exist. All JSON
     values pass through a ``default=`` handler that converts numpy scalar/
@@ -244,8 +254,15 @@ def write_artifacts(
     forecasts.to_parquet(artifacts_dir / "forecasts.parquet", index=False)
     history.to_parquet(artifacts_dir / "oos_history.parquet", index=False)
 
+    diagnostics: dict = {"wf_metrics": wf_metrics, "offsets": offsets}
+    if feature_importance is not None and not feature_importance.empty:
+        diagnostics["feature_importance"] = [
+            {"feature": str(r.feature), "importance": float(r.importance)}
+            for r in feature_importance.itertuples(index=False)
+        ]
+
     _write_json(artifacts_dir / "backtest.json", backtest_summary)
-    _write_json(artifacts_dir / "diagnostics.json", {"wf_metrics": wf_metrics, "offsets": offsets})
+    _write_json(artifacts_dir / "diagnostics.json", diagnostics)
 
     def _version(pkg: str) -> str | None:
         try:

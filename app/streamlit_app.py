@@ -89,6 +89,15 @@ def _quantile_row(row: pd.Series, col_prefix: str) -> dict[str, float]:
 def _cumulative_index(history: pd.DataFrame, ticker: str, n_months: int = 24) -> tuple[list, list[float]]:
     """Last ``n_months`` of a ticker's OOS ``y_true`` monthly returns,
     cumulated into a return index starting at 100.
+
+    Date convention (off-by-one fix): a history row dated ``t`` carries
+    ``y_true(t) = fwd_ret_1m(t)``, the return *realized during month t+1*
+    (see ``stockpred.features.stock.build_monthly_panel``). Plotting that
+    return at ``t`` would draw every realized move one month too early and
+    make the chart's right edge overlap the forecast's own month. Each
+    point is therefore plotted at ``t + 1 month`` — the month the return
+    actually happened — so the last plotted point sits immediately before
+    the forecast fan, with no overlap and no gap.
     """
     sub = history[history["ticker"] == ticker].sort_values("date").tail(n_months)
     if sub.empty:
@@ -98,7 +107,9 @@ def _cumulative_index(history: pd.DataFrame, ticker: str, n_months: int = 24) ->
     values: list[float] = []
     for d, ret in zip(sub["date"], sub["y_true"]):
         idx *= 1.0 + float(ret)
-        dates.append(d)
+        # Shift the *label*, not the value: this return was realized during
+        # the month after the row's feature date.
+        dates.append(pd.Timestamp(d) + pd.DateOffset(months=1))
         values.append(idx)
     return dates, values
 
@@ -148,13 +159,20 @@ def page_forecasts(data: dict[str, Any]) -> None:
         hist_dates, hist_index = _cumulative_index(oos_history, ticker)
     has_hist = bool(hist_dates)
 
+    # Same convention as _cumulative_index: the forecast made from panel
+    # month `pred_date` is a forecast of the return realized during the
+    # FOLLOWING month, so the fan's tip is drawn one month after pred_date.
+    forecast_month = (
+        pd.Timestamp(pred_date) + pd.DateOffset(months=1) if pred_date is not None else None
+    )
+
     if has_hist:
         last_date = pd.Timestamp(hist_dates[-1])
-        fan_date = pd.Timestamp(pred_date) if pred_date is not None else last_date + pd.DateOffset(months=1)
+        fan_date = forecast_month if forecast_month is not None else last_date + pd.DateOffset(months=1)
         if fan_date <= last_date:
             fan_date = last_date + pd.DateOffset(months=1)
     else:
-        fan_date = pd.Timestamp(pred_date) if pred_date is not None else pd.Timestamp.today()
+        fan_date = forecast_month if forecast_month is not None else pd.Timestamp.today()
         # No OOS history to anchor the fan's left edge -- without a distinct
         # start point the fan collapses to a single x position and the bands
         # never visibly widen. Anchor ~30 days (one month) before the
@@ -168,14 +186,19 @@ def page_forecasts(data: dict[str, Any]) -> None:
         title=f"{ticker}: indexed history (last 24m) + next-month fan"
               f"{' (ensemble)' if ensemble else ''}",
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
+    st.caption(
+        "History points are dated by the month the return was *realized* "
+        "(one month after the feature row it came from), and the fan tip "
+        "sits in the month this forecast is about."
+    )
     if not has_hist:
         st.caption("No OOS history for this ticker yet -- fan shown starting from an index of 100.")
 
     st.subheader("12-month scenario range")
     st.caption("Wide, humble scenario range — not a prediction.")
     y_q = _quantile_row(row, "y_q")
-    st.plotly_chart(charts.humble_band_chart(y_q), use_container_width=True)
+    st.plotly_chart(charts.humble_band_chart(y_q), width="stretch")
 
     st.subheader("Quantile table")
     raw_q = None
@@ -193,12 +216,12 @@ def page_forecasts(data: dict[str, Any]) -> None:
         "Yearly (12m)": y_q,
     }
     table_df = pd.DataFrame(table_rows).T[_QUANTILE_KEYS]
-    st.dataframe(table_df.style.format("{:.1%}"), use_container_width=True)
+    st.dataframe(table_df.style.format("{:.1%}"), width="stretch")
 
     if raw_q is not None:
         with st.expander("Pre-calibration (raw) LightGBM monthly quantiles"):
             raw_df = pd.DataFrame([raw_q], index=["Monthly (raw)"])[_QUANTILE_KEYS]
-            st.dataframe(raw_df.style.format("{:.1%}"), use_container_width=True)
+            st.dataframe(raw_df.style.format("{:.1%}"), width="stretch")
 
     ann_vol = row.get("ann_vol")
     converged = row.get("garch_converged")
@@ -236,7 +259,7 @@ def page_diagnostics(data: dict[str, Any]) -> None:
                 fold_r2 = {k: v.get("r2_oos_median") for k, v in folds.items()}
                 st.plotly_chart(
                     charts.r2_bar(fold_r2, pooled.get("r2_oos_median")),
-                    use_container_width=True,
+                    width="stretch",
                 )
             else:
                 st.info("No per-fold metrics available.")
@@ -244,7 +267,7 @@ def page_diagnostics(data: dict[str, Any]) -> None:
             if "coverage_raw_90" in offsets and "coverage_cal_90" in offsets:
                 st.plotly_chart(
                     charts.coverage_chart(offsets["coverage_raw_90"], offsets["coverage_cal_90"]),
-                    use_container_width=True,
+                    width="stretch",
                 )
             else:
                 st.info("No coverage data available.")
@@ -254,17 +277,44 @@ def page_diagnostics(data: dict[str, Any]) -> None:
         if pinball:
             st.dataframe(
                 pd.DataFrame([pinball]).style.format("{:.4f}"),
-                use_container_width=True,
+                width="stretch",
             )
         else:
             st.info("No pinball loss data available.")
 
+        st.subheader("Feature importance")
+        importance = diagnostics.get("feature_importance")
+        if importance:
+            st.plotly_chart(charts.feature_importance_bar(importance), width="stretch")
+        else:
+            st.info("No feature importance data available.")
+
         st.subheader("Conformal calibration offsets")
         if offsets:
             st.write(
-                f"90% interval offset: `{offsets.get('90', float('nan')):+.1%}`  |  "
-                f"50% interval offset: `{offsets.get('50', float('nan')):+.1%}`"
+                f"Pooled 90% interval offset: `{offsets.get('90', float('nan')):+.1%}`  |  "
+                f"pooled 50% interval offset: `{offsets.get('50', float('nan')):+.1%}`"
             )
+            st.caption(
+                "These pooled offsets are a whole-sample summary only. The "
+                "out-of-sample intervals above are calibrated **per fold** — "
+                "each fold uses offsets computed from its own, strictly "
+                "earlier calibration months — and the shipped forecast uses "
+                "its own trailing calibration block."
+            )
+            per_fold = offsets.get("per_fold")
+            if per_fold:
+                with st.expander("Per-fold conformal offsets (what actually calibrated the OOS intervals)"):
+                    pf_df = pd.DataFrame(
+                        [
+                            {"fold": int(k), "offset_90": v.get("90"), "offset_50": v.get("50")}
+                            for k, v in sorted(per_fold.items(), key=lambda kv: int(kv[0]))
+                        ]
+                    )
+                    st.dataframe(
+                        pf_df.style.format({"offset_90": "{:+.2%}", "offset_50": "{:+.2%}"}),
+                        width="stretch",
+                    )
         else:
             st.info("No offsets available.")
 
@@ -300,7 +350,7 @@ def page_backtest(data: dict[str, Any]) -> None:
 
     monthly_returns = backtest.get("monthly_returns", [])
     fig = charts.equity_curve(monthly_returns, backtest.get("benchmark_total_return"))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
     st.caption(
         "The benchmark line marks where an equal-weight buy-and-hold portfolio "
         "would have ended up (its compounded total return) -- per-month benchmark "
@@ -335,14 +385,14 @@ def page_backtest(data: dict[str, Any]) -> None:
             for col in ("ret", "gross_ret"):
                 if col in mr_df.columns:
                     mr_df[col] = mr_df[col].map(lambda v: f"{v:.1%}")
-            st.dataframe(mr_df, use_container_width=True)
+            st.dataframe(mr_df, width="stretch")
         else:
             st.info("No monthly returns recorded.")
 
     per_fold_sharpe = backtest.get("per_fold_sharpe")
     if per_fold_sharpe:
         with st.expander("Per-fold Sharpe"):
-            st.dataframe(pd.DataFrame(per_fold_sharpe), use_container_width=True)
+            st.dataframe(pd.DataFrame(per_fold_sharpe), width="stretch")
 
 
 # --------------------------------------------------------------------------

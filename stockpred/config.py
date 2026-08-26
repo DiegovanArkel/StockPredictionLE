@@ -26,6 +26,15 @@ _REQUIRED_KEYS = frozenset(
 # YAML keys that map onto Path-typed Config attributes.
 _PATH_KEYS = frozenset({"data_dir", "artifacts_dir", "duckdb_path"})
 
+# The ONLY supported quantile family. This is not a stylistic preference:
+# the q05/q25/q50/q75/q95 names are hardcoded downstream in the conformal
+# layer (stockpred/models/conformal.py operates on the (q05,q95) and
+# (q25,q75) pairs by name), the GARCH layer, artifact assembly, and the
+# dashboard's quantile tables and fan charts. Configuring a different set
+# would produce columns nothing downstream reads and silently break those
+# consumers, so it is rejected at load time instead.
+_SUPPORTED_QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95]
+
 
 @dataclass(frozen=True)
 class Config:
@@ -93,5 +102,16 @@ def load_config(path: str | Path = "config.yaml") -> Config:
     kwargs = dict(raw)
     for key in _PATH_KEYS:
         kwargs[key] = Path(kwargs[key])
+
+    if "quantiles" in kwargs:
+        quantiles = kwargs["quantiles"]
+        if not isinstance(quantiles, list) or [float(q) for q in quantiles] != _SUPPORTED_QUANTILES:
+            raise ValueError(
+                f"Unsupported 'quantiles' in {path}: {quantiles!r}. The only "
+                f"supported quantile family is {_SUPPORTED_QUANTILES} -- the "
+                "q05/q25/q50/q75/q95 names are hardcoded in the conformal "
+                "calibration layer, the GARCH layer, artifact assembly and "
+                "the dashboard. Omit the key to use the default."
+            )
 
     return Config(**kwargs)

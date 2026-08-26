@@ -4,7 +4,12 @@
 # (artifacts/*.parquet|json) and never imports stockpred or its heavy
 # modeling dependencies (lightgbm, arch, scikit-learn). Keep this file free
 # of those.
-streamlit>=1.30
+# The upper bound guards against a Streamlit MAJOR bump changing widget
+# APIs under a deploy that installs fresh on every rebuild. The dashboard
+# uses `width="stretch"` (Streamlit >= 1.49) for container-width layout;
+# `use_container_width` is deprecated as of 1.49 and removed in a future
+# release, so the floor is raised accordingly.
+streamlit>=1.49,<2
 plotly>=5.18
 pandas>=2.0
 pyarrow>=14.0

@@ -563,3 +563,109 @@ def test_build_monthly_panel_handles_mid_series_gap_month():
     # with a well-defined, correctly-computed forward target from July.
     jun_panel_row = panel[panel["date"] == jun].iloc[0]
     assert jun_panel_row["fwd_ret_1m"] == pytest.approx(0.02, abs=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# Panel-edge hygiene: in-progress trailing month
+# ---------------------------------------------------------------------------
+
+
+def _daily_prices_through(
+    ticker: str, start: str, end: str, start_price: float = 100.0, seed: int = 0
+) -> pd.DataFrame:
+    """Daily business-day prices for one ticker from `start` to `end`
+    inclusive, with small deterministic returns."""
+    rng = np.random.default_rng(seed)
+    dates = pd.bdate_range(start=start, end=end)
+    rets = rng.normal(0.0005, 0.01, size=len(dates))
+    level = start_price
+    levels = []
+    for r in rets:
+        level *= 1.0 + r
+        levels.append(level)
+    return pd.DataFrame(
+        {
+            "date": dates,
+            "ticker": ticker,
+            "close": levels,
+            "adj_close": levels,
+            "volume": 1_000.0,
+        }
+    )
+
+
+def _factors_for(dates: pd.DatetimeIndex) -> pd.DataFrame:
+    month_ends = pd.date_range(dates.min(), dates.max() + pd.offsets.MonthEnd(1), freq="ME")
+    n = len(month_ends)
+    return pd.DataFrame(
+        {
+            "date": month_ends,
+            "mkt_rf": [0.0] * n,
+            "smb": [0.0] * n,
+            "hml": [0.0] * n,
+            "mom": [0.0] * n,
+            "rf": [0.0] * n,
+        }
+    )
+
+
+def test_trailing_partial_month_is_dropped_from_panel():
+    """A ticker whose daily data stops mid-month must NOT get a row for that
+    month -- an in-progress month aggregated as if complete produces an
+    off-distribution mom_1m/vol_1m and would be what the production forecast
+    predicts from (see _drop_incomplete_trailing_month).
+    """
+    # Stops 2020-06-18: nearly two weeks of June trading still to come.
+    prices = _daily_prices_through("PARTIAL", "2019-01-01", "2020-06-18")
+    factors = _factors_for(pd.DatetimeIndex(prices["date"]))
+
+    panel = stock.build_monthly_panel(prices, factors, drop_missing_target=False)
+    dates = set(pd.DatetimeIndex(panel["date"]))
+
+    assert pd.Timestamp("2020-06-30") not in dates
+    assert pd.Timestamp("2020-05-31") in dates
+    # The last surviving month is the last COMPLETE one, and its own target
+    # is NaN (May's target would be June's partial return, which is gone).
+    assert panel["date"].max() == pd.Timestamp("2020-05-31")
+    assert pd.isna(panel.loc[panel["date"] == pd.Timestamp("2020-05-31"), "fwd_ret_1m"].iloc[0])
+
+
+def test_trailing_complete_month_is_kept_in_panel():
+    """The mirror case: data running to the month's last trading day keeps
+    that month."""
+    # 2020-06-30 is a Tuesday -- a full month of trading.
+    prices = _daily_prices_through("FULL", "2019-01-01", "2020-06-30")
+    factors = _factors_for(pd.DatetimeIndex(prices["date"]))
+
+    panel = stock.build_monthly_panel(prices, factors, drop_missing_target=False)
+    dates = set(pd.DatetimeIndex(panel["date"]))
+
+    assert pd.Timestamp("2020-06-30") in dates
+    assert panel["date"].max() == pd.Timestamp("2020-06-30")
+
+
+def test_month_ending_on_a_weekend_is_not_dropped():
+    """2020-05-31 is a Sunday; the last trading day is Friday 2020-05-29,
+    two calendar days earlier. That month is complete and must survive."""
+    prices = _daily_prices_through("WEEKEND", "2019-01-01", "2020-05-29")
+    factors = _factors_for(pd.DatetimeIndex(prices["date"]))
+
+    panel = stock.build_monthly_panel(prices, factors, drop_missing_target=False)
+    assert panel["date"].max() == pd.Timestamp("2020-05-31")
+
+
+def test_partial_month_does_not_become_previous_months_target():
+    """The partial month is dropped BEFORE the fwd_ret_1m shift, so no
+    complete month's target is ever a partial-month return."""
+    partial = _daily_prices_through("PARTIAL", "2019-01-01", "2020-06-18", seed=1)
+    complete = _daily_prices_through("FULL", "2019-01-01", "2020-06-30", seed=2)
+    prices = pd.concat([partial, complete], ignore_index=True)
+    factors = _factors_for(pd.DatetimeIndex(prices["date"]))
+
+    panel = stock.build_monthly_panel(prices, factors)  # targets required
+
+    partial_rows = panel[panel["ticker"] == "PARTIAL"]
+    # May's row is dropped by the missing-target rule, so April is the last.
+    assert partial_rows["date"].max() == pd.Timestamp("2020-04-30")
+    # The unaffected ticker keeps its full history.
+    assert panel[panel["ticker"] == "FULL"]["date"].max() == pd.Timestamp("2020-05-31")

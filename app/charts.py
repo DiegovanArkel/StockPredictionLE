@@ -195,6 +195,38 @@ def coverage_chart(
     return _base_layout(fig, title)
 
 
+def feature_importance_bar(
+    records: list[dict[str, Any]],
+    top_n: int = 20,
+    title: str = "Feature importance (mean LightGBM gain, q50 model, across folds)",
+) -> go.Figure:
+    """Horizontal bar chart of walk-forward feature importance.
+
+    ``records`` is ``diagnostics.json``'s ``feature_importance`` list --
+    ``[{"feature": str, "importance": float}, ...]``. The chart shows the
+    ``top_n`` most important features, largest at the top (Plotly draws a
+    horizontal bar's first category at the bottom, so the list is reversed
+    before plotting).
+    """
+    ranked = sorted(records, key=lambda r: float(r["importance"]), reverse=True)[:top_n]
+    ranked.reverse()  # so the largest ends up at the TOP of the drawn axis
+
+    fig = go.Figure(
+        go.Bar(
+            x=[float(r["importance"]) for r in ranked],
+            y=[str(r["feature"]) for r in ranked],
+            orientation="h",
+            marker=dict(color=_MEDIAN),
+            name="mean gain",
+        )
+    )
+    fig.update_layout(
+        xaxis_title="mean gain", showlegend=False,
+        height=max(280, 22 * len(ranked) + 120),
+    )
+    return _base_layout(fig, title)
+
+
 def equity_curve(
     monthly_returns: list[dict[str, Any]],
     benchmark_total_return: float | None = None,

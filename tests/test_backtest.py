@@ -97,9 +97,11 @@ class TestCostsReduceReturn:
         assert m["cost_eur"] > 0.0
         assert m["ret"] < m["gross_ret"]
 
-    def test_zero_turnover_second_month_no_cost(self):
+    def test_zero_turnover_second_month_charges_only_terminal_liquidation(self):
         # Same two tickers held both months -> no entries/exits in month 2,
-        # so month 2 should carry zero cost even with nonzero cost params.
+        # so month 2 carries NO turnover cost. It is the last month though,
+        # and the backtest ends holding both tickers, so it does carry the
+        # terminal liquidation cost -- and exactly that, nothing more.
         cfg = _make_config(
             cost_bps=50.0,
             cost_fixed_eur=5.0,
@@ -115,9 +117,20 @@ class TestCostsReduceReturn:
         df = pd.DataFrame(rows)
         result = run_backtest(df, cfg)
 
-        m2 = result["monthly_returns"][1]
-        assert m2["cost_eur"] == 0.0
-        assert m2["ret"] == pytest.approx(m2["gross_ret"])
+        m1, m2 = result["monthly_returns"]
+
+        # Reconstruct the expected terminal liquidation exactly.
+        capital_after_m1 = 10000.0 * (1.0 + m1["ret"])
+        capital_before_liquidation = capital_after_m1 * (1.0 + m2["gross_ret"])
+        notional_final = capital_before_liquidation / 2
+        expected_exit = 2 * (notional_final * cfg.cost_bps / 1e4 + cfg.cost_fixed_eur)
+
+        assert m2["cost_eur"] == pytest.approx(expected_exit)
+        assert m2["ret"] == pytest.approx(m2["gross_ret"] - expected_exit / capital_after_m1)
+        # And the equity identity still holds.
+        assert result["final_capital"] == pytest.approx(
+            capital_before_liquidation - expected_exit
+        )
 
 
 class TestNoSignalMonths:
@@ -207,8 +220,9 @@ class TestLiquidationOnNoSignalTransition:
         # liquidated in month 2, so this is not a held-through position).
         assert m3["cost_eur"] > 0.0
 
-        # n_trades: 2 entries (m1) + 2 exits (m2 liquidation) + 1 entry (m3).
-        assert result["n_trades"] == 5
+        # n_trades: 2 entries (m1) + 2 exits (m2 liquidation) + 1 entry (m3)
+        # + 1 terminal exit (the backtest ends holding A).
+        assert result["n_trades"] == 6
 
 
 class TestMaxDrawdown:
@@ -235,7 +249,8 @@ class TestMaxDrawdown:
 class TestNTrades:
     def test_counts_enters_and_exits_on_rotation(self):
         # month1: {A, B} enter (2). month2: {B, C} -> A exits, C enters (2).
-        # month3: {A, B} -> C exits, A enters (2). Total = 6.
+        # month3: {A, B} -> C exits, A enters (2). Then the backtest ends
+        # holding {A, B}, both of which are liquidated (2). Total = 8.
         cfg = _make_config(
             cost_bps=1.0,
             cost_fixed_eur=0.0,
@@ -253,7 +268,71 @@ class TestNTrades:
         df = pd.DataFrame(rows)
         result = run_backtest(df, cfg)
 
-        assert result["n_trades"] == 6
+        assert result["n_trades"] == 8
+
+
+class TestTerminalLiquidation:
+    """A backtest that ends holding positions must pay to get out of them --
+    ``final_capital`` is cash, not paper (see run_backtest's cost model).
+    """
+
+    def test_ending_in_cash_charges_nothing_extra(self):
+        cfg = _make_config(
+            cost_bps=50.0,
+            cost_fixed_eur=5.0,
+            signal_threshold=0.01,
+            loss_tolerance=-1.0,
+        )
+        rows = [
+            _row("A", "2020-01-31", 0.05, 0.0, 0.02, fold=0),
+            _row("A", "2020-02-29", 0.00, 0.0, 0.01, fold=0),  # exits, ends in cash
+        ]
+        result = run_backtest(pd.DataFrame(rows), cfg)
+
+        m1, m2 = result["monthly_returns"]
+        capital_after_m1 = 10000.0 * (1.0 + m1["ret"])
+        expected_exit = 1 * (capital_after_m1 / 1 * cfg.cost_bps / 1e4 + cfg.cost_fixed_eur)
+        # Month 2's cost is the ordinary signal-driven exit and nothing else.
+        assert m2["cost_eur"] == pytest.approx(expected_exit)
+        assert result["n_trades"] == 2  # 1 entry + 1 exit, no terminal charge
+
+    def test_terminal_exit_charged_exactly_once_at_final_notional(self):
+        cfg = _make_config(
+            cost_bps=50.0,
+            cost_fixed_eur=5.0,
+            signal_threshold=-1.0,
+            loss_tolerance=-1.0,
+        )
+        rows = [_row("A", "2020-01-31", 0.05, 0.0, 0.10, fold=0)]
+        result = run_backtest(pd.DataFrame(rows), cfg)
+
+        m = result["monthly_returns"][0]
+        entry_cost = 10000.0 / 1 * cfg.cost_bps / 1e4 + cfg.cost_fixed_eur
+        # capital_{t+1} = capital_t * (1 + gross_ret - cost / capital_t)
+        capital_before_liq = 10000.0 * (1.0 + 0.10 - entry_cost / 10000.0)
+        exit_cost = capital_before_liq * cfg.cost_bps / 1e4 + cfg.cost_fixed_eur
+
+        assert m["cost_eur"] == pytest.approx(entry_cost + exit_cost)
+        assert result["n_trades"] == 2  # 1 entry + 1 terminal exit
+        assert result["final_capital"] == pytest.approx(capital_before_liq - exit_cost)
+        assert result["final_capital"] == pytest.approx(
+            10000.0 * (1.0 + result["total_return"])
+        )
+
+    def test_zero_cost_config_leaves_results_untouched(self):
+        cfg = _make_config(
+            cost_bps=0.0,
+            cost_fixed_eur=0.0,
+            signal_threshold=-1.0,
+            loss_tolerance=-1.0,
+        )
+        rows = [
+            _row("A", "2020-01-31", 0.05, 0.0, 0.10, fold=0),
+            _row("A", "2020-02-29", 0.05, 0.0, 0.05, fold=0),
+        ]
+        result = run_backtest(pd.DataFrame(rows), cfg)
+        assert result["monthly_returns"][-1]["cost_eur"] == 0.0
+        assert result["total_return"] == pytest.approx(1.10 * 1.05 - 1.0)
 
 
 class TestOutputShapeAndSerializability:

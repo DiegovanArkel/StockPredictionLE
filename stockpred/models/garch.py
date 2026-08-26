@@ -144,6 +144,18 @@ def fit_and_simulate(
         return _bootstrap_fallback(clean, horizon_days, n_sims, seed)
 
     sim_horizon = max(horizon_days, _YEAR_HORIZON)
+    # Reseeding a private attribute is a deliberate, documented choice (see
+    # the module docstring), but it must fail LOUDLY rather than silently
+    # doing nothing if arch's internals move: assigning to a name that no
+    # longer exists would just create a dead attribute and leave the
+    # simulation unseeded (non-reproducible) with no error anywhere.
+    # `_generator` exists on the instance after Distribution.__init__ in
+    # arch 8.0.0, so hasattr here is a real check, not a class-level tautology.
+    if not hasattr(res.model.distribution, "_generator"):
+        raise RuntimeError(
+            "arch internals changed; simulation seeding broken -- pin arch or "
+            "update garch.py"
+        )
     res.model.distribution._generator = np.random.default_rng(seed)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")

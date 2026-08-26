@@ -75,7 +75,19 @@ def _write_sample_artifacts(artifacts_dir: Path) -> None:
             1: {"r2_oos_median": 0.03, "pinball_loss": {k: 0.03 for k in ["q05", "q25", "q50", "q75", "q95"]}, "coverage_90": 0.91, "n_train_months": 66, "n_test_rows": 30},
         },
     }
-    offsets = {"90": 0.01, "50": 0.005, "coverage_raw_90": 0.82, "coverage_cal_90": 0.89}
+    offsets = {
+        "90": 0.01,
+        "50": 0.005,
+        "per_fold": {"0": {"90": 0.012, "50": 0.006}, "1": {"90": 0.008, "50": 0.004}},
+        "coverage_raw_90": 0.82,
+        "coverage_cal_90": 0.89,
+    }
+    feature_importance = pd.DataFrame(
+        {
+            "feature": ["mom_12_1", "vol_12m", "beta_12m", "F1"],
+            "importance": [120.0, 90.5, 40.25, 10.0],
+        }
+    )
 
     monthly_returns = [
         {"date": m.strftime("%Y-%m-%d"), "ret": 0.01, "gross_ret": 0.012, "n_positions": 2, "cost_eur": 3.0}
@@ -108,6 +120,7 @@ def _write_sample_artifacts(artifacts_dir: Path) -> None:
         history=oos_history,
         failures=[],
         staleness={},
+        feature_importance=feature_importance,
     )
 
 
@@ -119,8 +132,11 @@ def sample_artifacts_dir(tmp_path: Path) -> Path:
 
 
 def test_default_artifacts_dir_renders_without_exception(monkeypatch):
-    """Repo-root artifacts/ is empty in this checkout (pre-Task-12) -- the
-    default run should hit the missing-artifacts path and still render.
+    """With no STOCKPRED_ARTIFACTS_DIR set, the app resolves the repo-root
+    ``artifacts/`` directory. Real artifacts ARE committed there, so this
+    exercises the populated path against the real pipeline output; on a
+    checkout where they are absent it exercises the missing-artifacts
+    placeholder path. Either way it must render without raising.
     """
     monkeypatch.delenv("STOCKPRED_ARTIFACTS_DIR", raising=False)
     at = AppTest.from_file(APP_PATH)
@@ -187,3 +203,45 @@ def test_forecasts_page_stale_ticker_shows_warning(monkeypatch, sample_artifacts
     at.run()
     assert not at.exception
     assert any("Stale forecast" in e.value for e in at.error)
+
+
+# ---------------------------------------------------------------------------
+# charts.feature_importance_bar (pure builder -- no Streamlit involved)
+# ---------------------------------------------------------------------------
+
+import sys  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "app"))
+import charts  # noqa: E402
+
+
+def test_feature_importance_bar_orders_largest_at_top_and_truncates():
+    records = [{"feature": f"f{i}", "importance": float(i)} for i in range(30)]
+    fig = charts.feature_importance_bar(records, top_n=5)
+
+    (trace,) = fig.data
+    # Plotly draws a horizontal bar chart's FIRST category at the bottom, so
+    # the y list runs smallest-importance-first for "largest at the top".
+    assert list(trace.y) == ["f25", "f26", "f27", "f28", "f29"]
+    assert list(trace.x) == [25.0, 26.0, 27.0, 28.0, 29.0]
+    assert trace.orientation == "h"
+
+
+def test_feature_importance_bar_handles_fewer_records_than_top_n():
+    fig = charts.feature_importance_bar(
+        [{"feature": "a", "importance": 1.0}, {"feature": "b", "importance": 2.0}], top_n=20
+    )
+    (trace,) = fig.data
+    assert list(trace.y) == ["a", "b"]
+
+
+def test_diagnostics_page_renders_feature_importance_chart(monkeypatch, sample_artifacts_dir):
+    monkeypatch.setenv("STOCKPRED_ARTIFACTS_DIR", str(sample_artifacts_dir))
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+    at.sidebar.radio[0].set_value("Diagnostics")
+    at.run()
+
+    assert not at.exception
+    # The placeholder must NOT be shown: importance data is present.
+    assert not any("No feature importance" in info.value for info in at.info)

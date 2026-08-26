@@ -8,9 +8,18 @@ on:
 permissions:
   contents: write
 
+# Never let two refreshes race each other onto the same branch: a queued run
+# waits for the in-flight one instead of cancelling it (cancel-in-progress:
+# false), since a half-finished run that has already pushed artifacts is
+# worse than a slightly late one.
+concurrency:
+  group: weekly-refresh
+  cancel-in-progress: false
+
 jobs:
   refresh:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -19,8 +28,29 @@ jobs:
           python-version: "3.11"
           cache: pip
 
+      # data/raw is gitignored, so a fresh runner starts with NO parquet
+      # cache -- which makes cached_fetch's "fall back to the last good
+      # snapshot" path unreachable and turns any provider flake into a hard
+      # failure. Restoring the previous run's cache gives that fallback
+      # something to fall back to. The key is unique per run (so this run
+      # always saves its own, fresher cache) while restore-keys matches the
+      # newest previous `data-raw-*` cache on a prefix.
+      - name: Restore raw data cache
+        uses: actions/cache@v4
+        with:
+          path: data/raw
+          key: data-raw-${{ github.run_id }}
+          restore-keys: |
+            data-raw-
+
       - name: Install dependencies
-        run: pip install -e .
+        run: pip install -e ".[dev]"
+
+      # Fail fast, before spending ~an hour on the pipeline -- and gate the
+      # artifact commit on a green suite, so a broken build never pushes
+      # artifacts back to the repo.
+      - name: Run tests
+        run: python -m pytest -q -m "not network"
 
       - name: Run pipeline
         run: python -m stockpred run

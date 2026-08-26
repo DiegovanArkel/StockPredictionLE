@@ -46,6 +46,36 @@ def build_macro_wide(macro: pd.DataFrame, min_date: str | pd.Timestamp | None = 
     start (leaving room for the 12-month log-diff's lookback) -- see
     :func:`stockpred.pipeline.run`, which passes ``cfg.price_start`` minus a
     2-year buffer.
+
+    Known limitation: the column filter is a FULL-SAMPLE statistic
+    -------------------------------------------------------------------
+    ``build_macro_wide`` is called **once**, on the whole macro history, in
+    :func:`stockpred.pipeline.run` -- before any walk-forward split. Which
+    columns survive the >30%-missing filter is therefore decided using the
+    NaN pattern of the entire sample, including months that later land in
+    test folds, and that decision reaches every fold's features (a fold
+    trains on the surviving columns, not on the columns it would have
+    selected from its own months alone).
+
+    This is a weak-form dependency and it is accepted deliberately rather
+    than restructured:
+
+    - Only the *availability pattern* (``isna()``) crosses the boundary --
+      never a value. No test-month observation influences any number a
+      model is fit on; the transforms, the standardization stats and the
+      PCA components are all still fit per fold on train months only
+      (:class:`MacroFactorExtractor`).
+    - The pattern being read is a publication-calendar fact about FRED/ECB
+      series (when each series starts and how often it is published), not a
+      property of the market outcome being predicted, so it carries no
+      information about future returns.
+    - The realistic alternative -- recomputing the surviving column set per
+      fold -- would make the feature matrix's *columns* vary by fold, which
+      the fixed ``F1..Fn`` factor contract downstream does not support, and
+      would trade a documented, information-free dependency for real
+      structural complexity.
+
+    Recorded as a known limitation in the README rather than hidden.
     """
     if min_date is not None:
         macro = macro[macro["date"] >= pd.Timestamp(min_date)]
