@@ -202,3 +202,61 @@ class TestPipelineRun:
         assert "fetch" not in summary["timings"]  # skipped
         assert summary["n_forecasts"] == len(forecasts)
         assert summary["metrics_keys"] == ["folds", "pooled"]
+
+        # Task 10 review fix: every production forecast row must carry the
+        # panel date its features actually came from, distinguishable from
+        # a stale ticker's forecast.
+        assert "pred_date" in forecasts.columns
+        assert forecasts["pred_date"].notna().all()
+
+
+class TestPipelineExcludesStaleTickers:
+    """Task 10 review fix: a ticker whose price feed silently stopped
+    updating (or was delisted) must not be predicted from months-stale
+    features and shipped indistinguishably from a fresh forecast."""
+
+    _STALE_TICKER = "T00"
+    _MONTHS_EARLY = 7  # comfortably past the pipeline's 3-month staleness cutoff
+
+    def test_stale_ticker_excluded_from_forecasts_and_named_in_manifest(
+        self, tmp_path, _synthetic_dataset
+    ):
+        prices = _synthetic_dataset["prices"].copy()
+        cutoff = prices["date"].max() - pd.DateOffset(months=self._MONTHS_EARLY)
+        stale_mask = (prices["ticker"] == self._STALE_TICKER) & (prices["date"] > cutoff)
+        prices = prices[~stale_mask].reset_index(drop=True)
+
+        data_dir = tmp_path / "data"
+        artifacts_dir = tmp_path / "artifacts"
+        save_parquet(prices, "prices", data_dir)
+        save_parquet(_synthetic_dataset["factors"], "factors", data_dir)
+        save_parquet(_synthetic_dataset["macro"], "macro", data_dir)
+
+        tickers = sorted(prices["ticker"].unique())
+        config = {
+            "tickers": tickers,
+            "fred_series": _FRED_LOG_DIFF_SERIES + _FRED_DIFF_SERIES,
+            "ecb_series": [],
+            "data_dir": str(data_dir),
+            "artifacts_dir": str(artifacts_dir),
+            "duckdb_path": str(data_dir / "stockpred.duckdb"),
+            "n_folds": 3,
+            "test_window_months": 12,
+            "embargo_months": 1,
+        }
+        config_path = tmp_path / "config.yaml"
+        with open(config_path, "w") as f:
+            yaml.safe_dump(config, f)
+
+        summary = pipeline.run(
+            config_path=config_path, skip_fetch=True, lgb_params=_FAST_LGB_PARAMS
+        )
+
+        forecasts = pd.read_parquet(artifacts_dir / "forecasts.parquet")
+        assert self._STALE_TICKER not in set(forecasts["ticker"])
+        assert len(forecasts) == _N_TICKERS - 1
+        assert summary["n_forecasts"] == len(forecasts)
+
+        with open(artifacts_dir / "manifest.json") as f:
+            manifest = json.load(f)
+        assert self._STALE_TICKER in manifest["failed_tickers"]

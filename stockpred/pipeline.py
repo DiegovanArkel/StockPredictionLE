@@ -22,6 +22,13 @@ scale of the whole sample: a trailing ``CAL_MONTHS`` calibration block
 still gives ``cqr_offsets`` a genuinely held-out calibration set for the
 production forecast's own CQR offsets, even though the macro factors
 themselves are fit on everything.
+
+Every production forecast row also carries the ``pred_date`` it was
+actually predicted from (the panel date its features came from, not
+today's date), and a ticker whose latest panel month is stale relative to
+the rest of the universe (delisted, or its feed silently stopped
+updating) is excluded from the forecast entirely rather than shipped
+looking as current as everything else -- see ``_production_forecast``.
 """
 
 from __future__ import annotations
@@ -55,6 +62,18 @@ from stockpred.validation import decay_weights
 logger = logging.getLogger(__name__)
 
 _MACRO_COLUMNS = ["date", "series_id", "value"]
+
+# A ticker whose last available panel month is more than this many months
+# older than the freshest ticker's last month (e.g. delisted, or its price
+# feed silently stopped updating) is excluded from the production forecast
+# rather than being predicted from stale, months-old features.
+_STALE_MONTHS = 3
+
+# Mirrors stockpred.models.workhorse._MIN_FIT_MONTHS: the minimum number of
+# fit-only months required after carving CAL_MONTHS off the training panel,
+# so the one-shot production calibration split has the same guard the
+# per-fold walk-forward split enforces.
+_MIN_FIT_MONTHS = 12
 
 
 class _StageTimer:
@@ -136,7 +155,7 @@ def _production_forecast(
     macro_wide: pd.DataFrame,
     cfg: Config,
     lgb_params: dict | None,
-) -> tuple[pd.DataFrame, dict]:
+) -> tuple[pd.DataFrame, dict, list[str]]:
     """Refit the workhorse model on ALL available data and predict the
     latest available month per ticker.
 
@@ -144,6 +163,20 @@ def _production_forecast(
     the one place in the pipeline that's allowed, since this is the
     production forecast itself, not a reported metric (see module
     docstring).
+
+    Tickers whose latest panel month is more than ``_STALE_MONTHS`` months
+    older than the freshest ticker's latest month (e.g. delisted, or a
+    price feed that silently stopped updating) are excluded from the
+    prediction entirely -- their last real feature row is too old to trust
+    -- and returned separately as ``stale_tickers`` rather than being
+    predicted from months-stale features and stamped with today's
+    ``as_of`` date as if they were current.
+
+    Returns ``(final_pred, offsets_prod, stale_tickers)``, where
+    ``final_pred`` additionally carries a ``pred_date`` column -- the panel
+    date each row's features actually came from -- for
+    :func:`stockpred.artifacts.assemble_forecasts` to pass through into the
+    written forecast.
     """
     feature_cols = _production_feature_cols(cfg)
 
@@ -152,12 +185,24 @@ def _production_forecast(
 
     train_rows = _merge_factors(panel, factors_wide)
 
-    pred_rows = _merge_factors(
-        panel_full.sort_values("date").groupby("ticker", as_index=False, sort=False).tail(1),
-        factors_wide,
-    )
-
     unique_months = pd.DatetimeIndex(sorted(train_rows["date"].unique()))
+    if len(unique_months) < CAL_MONTHS + _MIN_FIT_MONTHS:
+        raise ValueError(
+            f"_production_forecast: only {len(unique_months)} train months "
+            f"available, need at least {CAL_MONTHS + _MIN_FIT_MONTHS} "
+            f"({CAL_MONTHS} calibration + {_MIN_FIT_MONTHS} minimum fit)"
+        )
+
+    latest_per_ticker = (
+        panel_full.sort_values("date").groupby("ticker", as_index=False, sort=False).tail(1)
+    )
+    global_max_date = latest_per_ticker["date"].max()
+    stale_cutoff = global_max_date - pd.DateOffset(months=_STALE_MONTHS)
+    is_fresh = latest_per_ticker["date"] >= stale_cutoff
+    stale_tickers = sorted(latest_per_ticker.loc[~is_fresh, "ticker"].tolist())
+
+    pred_rows = _merge_factors(latest_per_ticker.loc[is_fresh], factors_wide)
+
     cal_months = unique_months[-CAL_MONTHS:]
     fit_months = unique_months[:-CAL_MONTHS]
 
@@ -186,12 +231,17 @@ def _production_forecast(
     model_all.fit(X_all, y_all, sample_weight=w_all)
 
     preds = model_all.predict(pred_rows[feature_cols])
-    final_pred = pd.DataFrame({"ticker": pred_rows["ticker"].to_numpy()})
+    final_pred = pd.DataFrame(
+        {
+            "ticker": pred_rows["ticker"].to_numpy(),
+            "pred_date": pred_rows["date"].to_numpy(),
+        }
+    )
     for col in preds.columns:
         final_pred[col] = preds[col].to_numpy()
 
     final_pred = apply_cqr(final_pred, offsets_prod)
-    return final_pred, offsets_prod
+    return final_pred, offsets_prod, stale_tickers
 
 
 def run(
@@ -250,9 +300,20 @@ def run(
         garch_df = garch_all(prices_df)
 
     with _StageTimer("production_forecast", timings):
-        final_pred, offsets_prod = _production_forecast(
+        final_pred, offsets_prod, stale_tickers = _production_forecast(
             panel, panel_full, macro_wide, cfg, lgb_params
         )
+        if stale_tickers:
+            logger.warning(
+                "excluding %d stale ticker(s) from the production forecast "
+                "(last panel month more than %d months before the freshest "
+                "ticker's): %s",
+                len(stale_tickers),
+                _STALE_MONTHS,
+                stale_tickers,
+            )
+            failures = sorted(set(failures) | set(stale_tickers))
+            garch_df = garch_df[~garch_df["ticker"].isin(stale_tickers)].reset_index(drop=True)
 
     with _StageTimer("assemble_and_write", timings):
         as_of = _date.today().isoformat()

@@ -174,6 +174,32 @@ class TestAssembleForecasts:
         np.testing.assert_allclose(ens_vals, raw_ens)
 
 
+class TestPredDatePassthrough:
+    """Task 10 fix: pred_date (the panel date a production row's features
+    came from) must survive assemble_forecasts untouched when final_pred
+    carries it, and must be absent when it doesn't (existing callers)."""
+
+    def test_pred_date_present_and_formatted_when_supplied(self):
+        final_pred = _final_pred()
+        final_pred["pred_date"] = pd.to_datetime(
+            ["2026-06-30", "2026-05-31", "2026-06-30"]
+        )
+
+        out = assemble_forecasts(
+            final_pred, _garch_df(), offsets={"90": 0.01, "50": 0.005}, as_of="2026-08-26"
+        ).set_index("ticker")
+
+        assert out.loc["AAA", "pred_date"] == "2026-06-30"
+        assert out.loc["BBB", "pred_date"] == "2026-05-31"
+        assert out.loc["CCC", "pred_date"] == "2026-06-30"
+
+    def test_pred_date_absent_when_not_supplied(self):
+        out = assemble_forecasts(
+            _final_pred(), _garch_df(), offsets={"90": 0.01, "50": 0.005}, as_of="2026-08-26"
+        )
+        assert "pred_date" not in out.columns
+
+
 class TestYearlyRecenterUsesPostSortMedian:
     """Regression test for a bug where the yearly recentering anchor was
     computed from pre-sort/label values instead of the *displayed*

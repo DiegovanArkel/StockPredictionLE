@@ -57,7 +57,12 @@ def assemble_forecasts(
     ``final_pred``: ``[ticker, q05, q25, q50, q75, q95, q05_cal, q25_cal,
     q75_cal, q95_cal]`` -- CQR-calibrated LightGBM monthly quantiles (see
     :func:`stockpred.models.conformal.apply_cqr`; only the tails are
-    calibrated, so there is no ``q50_cal``).
+    calibrated, so there is no ``q50_cal``). An optional ``pred_date``
+    column -- the panel date the row's features actually came from (see
+    :func:`stockpred.pipeline._production_forecast`) -- is passed through
+    untouched into the output when present, so a stale/delisted ticker's
+    forecast can be told apart from a fresh one downstream; it plays no
+    part in any of the math below.
 
     ``garch_df``: :func:`stockpred.models.garch.garch_all` output --
     ``[ticker, ann_vol, m_q05..m_q95, y_q05..y_q95, converged]``.
@@ -78,7 +83,8 @@ def assemble_forecasts(
     pure (calibrated) LightGBM quantiles.
 
     Returns one row per ticker with columns:
-    ``ticker, as_of, q05..q95`` (calibrated LightGBM -- the monthly display
+    ``ticker, as_of`` (plus ``pred_date`` when ``final_pred`` carries it),
+    ``q05..q95`` (calibrated LightGBM -- the monthly display
     quantiles), ``raw_q05, raw_q25, raw_q75, raw_q95`` (pre-calibration,
     for diagnostics), ``ens_q05..ens_q95`` (elementwise mean of calibrated
     LightGBM and GARCH month quantiles, or the LightGBM value alone),
@@ -103,6 +109,14 @@ def assemble_forecasts(
     as_of_str = pd.Timestamp(as_of).strftime("%Y-%m-%d")
 
     out = pd.DataFrame({"ticker": merged["ticker"], "as_of": as_of_str})
+
+    # Optional provenance column: the panel date the production prediction's
+    # features actually came from (see stockpred.pipeline._production_forecast).
+    # Only present when the caller's final_pred carries it -- passed through
+    # untouched (not consumed by any of the math below) so a stale/delisted
+    # ticker's forecast is distinguishable from a fresh one downstream.
+    if "pred_date" in final_pred.columns:
+        out["pred_date"] = pd.to_datetime(merged["pred_date"]).dt.strftime("%Y-%m-%d")
 
     # Monthly display quantiles: calibrated tails, uncalibrated median.
     out["q05"] = merged["q05_cal"]
