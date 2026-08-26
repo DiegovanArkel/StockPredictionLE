@@ -11,5 +11,9 @@
 # release, so the floor is raised accordingly.
 streamlit>=1.49,<2
 plotly>=5.18
-pandas>=2.0
+# Bounded to the same major range as pyproject.toml's dependency: the
+# dashboard reads parquet written by the pipeline, so the two must not be
+# able to resolve different pandas majors from the same repo. The tested
+# version is 3.0.5.
+pandas>=2.0,<4
 pyarrow>=14.0
