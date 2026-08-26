@@ -36,29 +36,45 @@ def run_backtest(oos_calibrated: pd.DataFrame, cfg: Any) -> dict:
     go long a ticker iff ``q50 > cfg.signal_threshold`` AND
     ``q05_cal > cfg.loss_tolerance``; otherwise stay in cash for that
     ticker. Selected tickers in a given month are held equal-weight; a
-    month with no selected tickers is 100% cash.
+    month with no selected tickers is 100% cash for its *gross* return.
 
     **Capital / cost model** (deterministic, reproducible from the
     ``monthly_returns`` output alone):
 
     - Capital starts at EUR 10,000 and compounds with each month's *net*
       return: ``capital_{t+1} = capital_t * (1 + ret_t)``.
-    - A month with zero selected tickers is a flat cash month: ``ret = 0``,
-      ``gross_ret = 0``, ``cost_eur = 0``, and the held-ticker set resets to
-      empty (liquidating into cash is not charged a cost -- an explicit,
-      documented simplification; re-entering any ticker in a later month is
-      then charged as a fresh entry).
-    - Otherwise, gross return = equal-weight mean of ``y_true`` over the
-      selected tickers. Trading cost is turnover-based and charged only on
-      tickers *entering* (in this month's selection, not last month's held
-      set) or *exiting* (in last month's held set, not this month's
-      selection) -- a ticker held in both consecutive months incurs no
-      cost. Each traded ticker's notional is
-      ``position_notional = capital_t / n_positions_t`` (this month's
-      equal split of capital at the start of the month); its cost is
-      ``position_notional * cfg.cost_bps / 1e4 + cfg.cost_fixed_eur``.
-      Total monthly cost is the sum over all entered + exited tickers.
-      Net return = gross return - total_cost / capital_t.
+    - Gross return = equal-weight mean of ``y_true`` over the selected
+      tickers, or ``0.0`` when nothing is selected (100% cash).
+    - Trading cost is turnover-based and charged only on tickers
+      *entering* (in this month's selection, not last month's held set) or
+      *exiting* (in last month's held set, not this month's selection) --
+      a ticker held in both consecutive months incurs no cost. Liquidating
+      into cash is a real exit for every previously-held ticker and is
+      costed exactly like any other exit -- a no-signal month is only free
+      when it follows another no-signal month (both the held set and the
+      selected set are empty, so there is nothing to trade).
+    - The two trade directions use different notionals, since they close
+      out different capital allocations:
+
+      - *Entered* tickers are costed against **this month's** equal split
+        of capital, ``notional_new = capital_t / n_positions_t`` (the size
+        of the new position being opened; undefined/unused when nothing is
+        entered, which requires ``n_positions_t > 0`` whenever it applies).
+      - *Exited* tickers are costed against **last month's** equal split
+        of capital, ``notional_old = capital_t / len(prev_holdings)`` (the
+        size of the closed position being sold, using this month's starting
+        capital but last month's holding count; requires
+        ``len(prev_holdings) > 0`` whenever it applies, since ``exited`` is
+        only non-empty when there was something held to exit from).
+
+      Each traded ticker's cost is
+      ``notional * cfg.cost_bps / 1e4 + cfg.cost_fixed_eur`` using its
+      direction's notional above. Total monthly cost is the sum over all
+      entered + exited tickers. Net return = gross return -
+      total_cost / capital_t. A hold -> no-signal transition therefore has
+      ``gross_ret == 0.0`` and ``ret == -cost_eur / capital_t`` (a real,
+      negative, capital-compounding cost -- not a free flat month); only a
+      cash -> cash transition is truly ``ret == cost_eur == 0.0``.
 
     **Outputs** -- returns a dict of native Python types only (every value
     round-trips through ``json.dumps``):
@@ -114,22 +130,37 @@ def run_backtest(oos_calibrated: pd.DataFrame, cfg: Any) -> dict:
         selected_tickers = set(selected["ticker"])
         n_positions = len(selected_tickers)
 
-        if n_positions == 0:
-            gross_ret = 0.0
-            cost_eur = 0.0
-            ret = 0.0
-            prev_holdings = set()
-        else:
-            gross_ret = float(selected["y_true"].mean())
-            position_notional = capital / n_positions
-            entered = selected_tickers - prev_holdings
-            exited = prev_holdings - selected_tickers
-            n_traded = len(entered) + len(exited)
-            cost_per_ticker = position_notional * cfg.cost_bps / 1e4 + cfg.cost_fixed_eur
-            cost_eur = n_traded * cost_per_ticker
-            n_trades += n_traded
-            ret = gross_ret - cost_eur / capital
-            prev_holdings = selected_tickers
+        gross_ret = float(selected["y_true"].mean()) if n_positions else 0.0
+
+        # Entered/exited are computed uniformly regardless of whether this
+        # month has any selections at all -- a no-signal month with
+        # non-empty prev_holdings is a real liquidation (every held ticker
+        # exits), not a costless no-op; only a cash->cash month (both sets
+        # empty) is genuinely free.
+        entered = selected_tickers - prev_holdings
+        exited = prev_holdings - selected_tickers
+
+        cost_eur = 0.0
+        if entered:
+            # New positions are costed against *this* month's equal split
+            # of capital (entered is non-empty => n_positions > 0, so this
+            # division is safe).
+            notional_new = capital / n_positions
+            cost_eur += len(entered) * (notional_new * cfg.cost_bps / 1e4 + cfg.cost_fixed_eur)
+        if exited:
+            # Closed positions are costed against the notional they
+            # actually held -- last month's equal split of capital over
+            # last month's holding count (exited is non-empty =>
+            # prev_holdings is non-empty, so this division is safe) -- not
+            # this month's (possibly zero) position count.
+            notional_old = capital / len(prev_holdings)
+            cost_eur += len(exited) * (notional_old * cfg.cost_bps / 1e4 + cfg.cost_fixed_eur)
+
+        n_traded = len(entered) + len(exited)
+        n_trades += n_traded
+
+        ret = gross_ret - cost_eur / capital
+        prev_holdings = selected_tickers
 
         capital = capital * (1.0 + ret)
 

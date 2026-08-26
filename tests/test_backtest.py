@@ -162,6 +162,55 @@ class TestNoSignalMonths:
         assert m["gross_ret"] == pytest.approx(0.20)
 
 
+class TestLiquidationOnNoSignalTransition:
+    def test_hold_then_no_signal_then_reenter_charges_exit_cost(self):
+        # month1: A, B both selected -> both entered (fresh cost).
+        # month2: nothing clears the threshold -> A, B both exit (real
+        # liquidation, charged), gross_ret == 0.0, ret == -cost/capital.
+        # month3: A selected again -> fresh entry (not a "held" carry-over,
+        # since prev_holdings was reset to empty by month2).
+        cfg = _make_config(
+            cost_bps=50.0,
+            cost_fixed_eur=5.0,
+            signal_threshold=0.01,
+            loss_tolerance=-1.0,
+        )
+        rows = [
+            _row("A", "2020-01-31", 0.05, 0.0, 0.02, fold=0),
+            _row("B", "2020-01-31", 0.05, 0.0, 0.03, fold=0),
+            _row("A", "2020-02-29", 0.00, 0.0, 0.01, fold=0),  # fails threshold
+            _row("B", "2020-02-29", 0.00, 0.0, 0.01, fold=0),  # fails threshold
+            _row("A", "2020-03-31", 0.05, 0.0, 0.01, fold=0),
+        ]
+        df = pd.DataFrame(rows)
+        result = run_backtest(df, cfg)
+
+        m1, m2, m3 = result["monthly_returns"]
+
+        assert m1["n_positions"] == 2
+        assert m2["n_positions"] == 0
+        assert m3["n_positions"] == 1
+
+        # Month 2 is a real liquidation, not a free flat month.
+        assert m2["gross_ret"] == 0.0
+        assert m2["cost_eur"] > 0.0
+
+        capital_after_m1 = 10000.0 * (1.0 + m1["ret"])
+        expected_notional_old = capital_after_m1 / 2  # 2 tickers held going into month 2
+        expected_cost_m2 = 2 * (
+            expected_notional_old * cfg.cost_bps / 1e4 + cfg.cost_fixed_eur
+        )
+        assert m2["cost_eur"] == pytest.approx(expected_cost_m2)
+        assert m2["ret"] == pytest.approx(-m2["cost_eur"] / capital_after_m1)
+
+        # Month 3's re-entry is charged as a fresh entry (A was fully
+        # liquidated in month 2, so this is not a held-through position).
+        assert m3["cost_eur"] > 0.0
+
+        # n_trades: 2 entries (m1) + 2 exits (m2 liquidation) + 1 entry (m3).
+        assert result["n_trades"] == 5
+
+
 class TestMaxDrawdown:
     def test_exact_on_constructed_path(self):
         # Single ticker each month, zero cost: net returns = [0.20, -0.50].
