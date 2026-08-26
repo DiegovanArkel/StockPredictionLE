@@ -25,7 +25,7 @@ _FFILL_LIMIT = 2
 _MAX_MISSING_FRAC = 0.30
 
 
-def build_macro_wide(macro: pd.DataFrame) -> pd.DataFrame:
+def build_macro_wide(macro: pd.DataFrame, min_date: str | pd.Timestamp | None = None) -> pd.DataFrame:
     """Pivot tidy macro data to a stationary, wide monthly panel.
 
     Steps: pivot ``[date, series_id, value]`` to wide, resample to month-end
@@ -33,7 +33,23 @@ def build_macro_wide(macro: pd.DataFrame) -> pd.DataFrame:
     ``INDPRO``/``CPIAUCSL``/``M2SL``, 1m diff for everything else),
     forward-fill gaps of at most 2 months, then drop columns that are still
     >30% missing.
+
+    ``min_date``, if given, clips the input to ``date >= min_date`` *before*
+    pivoting -- i.e. before the missing-fraction column drop is computed.
+    This matters because FRED series each start on their own historical
+    date (INDPRO from 1919, VIXCLS from 1990, DTWEXBGS from 2006, ...): with
+    no clip, the wide panel's index is forced back to the earliest series'
+    start, and every later-starting series then reads as mostly-missing over
+    that artificially long range and gets dropped by the >30% filter even
+    though it is fully populated over the period the model actually trains
+    on. Callers should pass a date comfortably before the training window's
+    start (leaving room for the 12-month log-diff's lookback) -- see
+    :func:`stockpred.pipeline.run`, which passes ``cfg.price_start`` minus a
+    2-year buffer.
     """
+    if min_date is not None:
+        macro = macro[macro["date"] >= pd.Timestamp(min_date)]
+
     wide = macro.pivot(index="date", columns="series_id", values="value").sort_index()
     wide = wide.resample("ME").last()
 

@@ -285,7 +285,17 @@ def run(
     with _StageTimer("features", timings):
         panel = build_monthly_panel(prices_df, factors_df)
         panel_full = build_monthly_panel(prices_df, factors_df, drop_missing_target=False)
-        macro_wide = build_macro_wide(macro_df)
+        # Clip macro history to price_start minus a 2-year buffer (room for
+        # the 12-month log-diff lookback) before computing the wide panel.
+        # FRED's keyless endpoint returns each series' FULL history (e.g.
+        # INDPRO back to 1919); with no clip that forces build_macro_wide's
+        # missing-fraction column drop to evaluate every series against an
+        # 1919-2026 index, which drops later-starting series (VIXCLS,
+        # DTWEXBGS, ...) as "mostly missing" even though they're fully
+        # populated over the window the model actually trains on -- see
+        # stockpred.features.macro_pca.build_macro_wide's min_date docstring.
+        macro_min_date = pd.Timestamp(cfg.price_start) - pd.DateOffset(years=2)
+        macro_wide = build_macro_wide(macro_df, min_date=macro_min_date)
 
     with _StageTimer("walk_forward", timings):
         wf = run_walk_forward(panel, macro_wide, cfg, lgb_params=lgb_params)

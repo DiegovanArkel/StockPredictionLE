@@ -142,6 +142,30 @@ def test_columns_over_30pct_missing_after_transform_are_dropped():
     assert "SPARSE_SERIES" not in wide.columns
 
 
+def test_min_date_clip_saves_a_late_starting_series_from_the_missing_filter():
+    # LONG_SERIES has full history back to month 0; LATE_SERIES only starts
+    # partway through -- reproduces the real-data shape (INDPRO from 1919
+    # forcing VIXCLS/DTWEXBGS-like later starters to read as mostly-missing
+    # over the full unclipped range) at a tiny, test-sized scale.
+    n = 40
+    dates = _month_ends(n)
+    long_series = [100.0 + i for i in range(n)]
+    late_start = 25
+    late_series = [np.nan] * late_start + [50.0 + i for i in range(n - late_start)]
+    macro = _tidy_macro({"LONG_SERIES": long_series, "LATE_SERIES": late_series}, dates)
+
+    # Unclipped: LATE_SERIES is NaN over 25/40 = 62.5% of the full range,
+    # comfortably over the 30% threshold -- dropped.
+    wide_unclipped = build_macro_wide(macro)
+    assert "LATE_SERIES" not in wide_unclipped.columns
+
+    # Clipped to LATE_SERIES's own start: it's fully populated over the
+    # window that matters and survives.
+    wide_clipped = build_macro_wide(macro, min_date=dates[late_start])
+    assert "LATE_SERIES" in wide_clipped.columns
+    assert wide_clipped.index.min() == dates[late_start]
+
+
 # ---------------------------------------------------------------------------
 # MacroFactorExtractor
 # ---------------------------------------------------------------------------

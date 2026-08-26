@@ -17,13 +17,16 @@ def test_load_config_default_path_returns_config():
     assert isinstance(config, Config)
 
 
-def test_load_config_has_25_aex_tickers():
+def test_load_config_has_24_aex_tickers():
+    # TKWY (Just Eat Takeaway) is excluded: delisted from Yahoo Finance,
+    # verified 404 on the yfinance endpoint during the Task 12 real-data run.
     config = load_config(DEFAULT_CONFIG_PATH)
     assert isinstance(config.tickers, list)
-    assert len(config.tickers) == 25
-    assert len(set(config.tickers)) == 25  # no duplicates
+    assert len(config.tickers) == 24
+    assert len(set(config.tickers)) == 24  # no duplicates
     assert "ASML" in config.tickers
     assert "ADYEN" in config.tickers
+    assert "TKWY" not in config.tickers
 
 
 def test_load_config_default_quantiles():
@@ -119,4 +122,4 @@ def test_load_config_string_path_argument_default(monkeypatch):
     monkeypatch.chdir(REPO_ROOT)
     config = load_config("config.yaml")
     assert isinstance(config, Config)
-    assert len(config.tickers) == 25
+    assert len(config.tickers) == 24
