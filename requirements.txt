@@ -1,0 +1,19 @@
+# Streamlit Cloud requirements for app/streamlit_app.py.
+#
+# Deliberately lightweight: the dashboard only reads precomputed artifacts
+# (artifacts/*.parquet|json) and never imports stockpred or its heavy
+# modeling dependencies (lightgbm, arch, scikit-learn). Keep this file free
+# of those.
+# The upper bound guards against a Streamlit MAJOR bump changing widget
+# APIs under a deploy that installs fresh on every rebuild. The dashboard
+# uses `width="stretch"` (Streamlit >= 1.49) for container-width layout;
+# `use_container_width` is deprecated as of 1.49 and removed in a future
+# release, so the floor is raised accordingly.
+streamlit>=1.49,<2
+plotly>=5.18
+# Bounded to the same major range as pyproject.toml's dependency: the
+# dashboard reads parquet written by the pipeline, so the two must not be
+# able to resolve different pandas majors from the same repo. The tested
+# version is 3.0.5.
+pandas>=2.0,<4
+pyarrow>=14.0

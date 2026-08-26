@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "stockpred"
+version = "0.1.0"
+description = "Probabilistic stock forecasting system for the AEX universe."
+readme = "README.md"
+requires-python = ">=3.11"
+# Upper bounds are deliberately loose -- they guard against a MAJOR version
+# bump silently changing modeling behaviour, not against minor upgrades.
+# `arch` is pinned tightest because stockpred/models/garch.py reseeds a
+# private attribute of its distribution objects for reproducibility (there
+# is a hard runtime guard there, but the pin is what keeps it from firing).
+#
+# Every upper bound here must ADMIT the version this project is actually
+# developed and tested against, or CI installs something nobody has run:
+# pandas 3.0.5, numpy 2.4.6, scikit-learn 1.9.0, lightgbm 4.7.0, arch 8.0.0,
+# streamlit 1.62.0 (recorded per run in artifacts/manifest.json). Check a
+# bound against the installed version before changing it.
+dependencies = [
+    "pandas>=2.0,<4",
+    "numpy>=1.26,<3",
+    "scipy",
+    "scikit-learn>=1.3,<2",
+    "lightgbm>=4.0,<5",
+    "arch>=8,<9",
+    "yfinance",
+    "pandas-datareader",
+    "ecbdata",
+    "duckdb",
+    "pyarrow",
+    "pyyaml",
+    "requests",
+    # >=1.49 for `width="stretch"` (the replacement for the now-deprecated
+    # `use_container_width`); keep in step with requirements.txt.
+    "streamlit>=1.49,<2",
+    "plotly",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["stockpred"]

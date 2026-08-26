@@ -1,0 +1,53 @@
+# StockPredictionLE configuration.
+# See stockpred/config.py for the Config dataclass and documented defaults
+# for any key omitted here.
+
+tickers:
+  - ABN
+  - ADYEN
+  - AGN
+  - AD
+  - AKZA
+  - ASM
+  - ASML
+  - ASRNL
+  - BESI
+  - DSFIR
+  - EXO
+  - HEIA
+  - IMCD
+  - INGA
+  - KPN
+  - MT
+  - NN
+  - PHIA
+  - PRX
+  - RAND
+  - REN
+  - SHELL
+  - UMG
+  - WKL
+
+price_start: "2000-01-01"
+
+fred_series:
+  - INDPRO
+  - CPIAUCSL
+  - UNRATE
+  - FEDFUNDS
+  - T10Y2Y
+  - T10Y3M
+  - VIXCLS
+  - DTWEXBGS
+  - DGS10
+  - DCOILBRENTEU
+  - USEPUINDXD
+  - M2SL
+
+ecb_series:
+  - ICP.M.U2.N.000000.4.ANR
+  - MIR.M.U2.B.A2A.A.R.A.2240.EUR.N
+
+data_dir: data
+artifacts_dir: artifacts
+duckdb_path: data/stockpred.duckdb

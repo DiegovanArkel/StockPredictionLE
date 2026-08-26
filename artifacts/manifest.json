@@ -1,0 +1,13 @@
+{
+  "generated_at": "2026-08-26T23:24:26.815449+00:00",
+  "n_forecasts": 24,
+  "n_history_rows": 2146,
+  "failed_tickers": [],
+  "stale_sources": {},
+  "versions": {
+    "pandas": "3.0.5",
+    "lightgbm": "4.7.0",
+    "arch": "8.0.0",
+    "stockpred": "0.1.0"
+  }
+}
