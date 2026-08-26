@@ -140,7 +140,7 @@ def humble_band_chart(
             name="Median",
         )
     )
-    fig.update_layout(barmode="overlay", xaxis=dict(tickformat=".0%"))
+    fig.update_layout(barmode="overlay", xaxis=dict(tickformat=".1%"))
     return _base_layout(fig, title)
 
 

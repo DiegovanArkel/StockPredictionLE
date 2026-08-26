@@ -146,14 +146,22 @@ def page_forecasts(data: dict[str, Any]) -> None:
     hist_dates, hist_index = ([], [])
     if oos_history is not None and not oos_history.empty:
         hist_dates, hist_index = _cumulative_index(oos_history, ticker)
+    has_hist = bool(hist_dates)
 
-    if hist_dates:
+    if has_hist:
         last_date = pd.Timestamp(hist_dates[-1])
         fan_date = pd.Timestamp(pred_date) if pred_date is not None else last_date + pd.DateOffset(months=1)
         if fan_date <= last_date:
             fan_date = last_date + pd.DateOffset(months=1)
     else:
         fan_date = pd.Timestamp(pred_date) if pred_date is not None else pd.Timestamp.today()
+        # No OOS history to anchor the fan's left edge -- without a distinct
+        # start point the fan collapses to a single x position and the bands
+        # never visibly widen. Anchor ~30 days (one month) before the
+        # forecast date instead, at the base-100 index, so the fan still
+        # fans out.
+        anchor_date = fan_date - pd.Timedelta(days=30)
+        hist_dates, hist_index = [anchor_date], [100.0]
 
     fig = charts.fan_chart(
         hist_dates, hist_index, fan_date, monthly_q,
@@ -161,7 +169,7 @@ def page_forecasts(data: dict[str, Any]) -> None:
               f"{' (ensemble)' if ensemble else ''}",
     )
     st.plotly_chart(fig, use_container_width=True)
-    if not hist_dates:
+    if not has_hist:
         st.caption("No OOS history for this ticker yet -- fan shown starting from an index of 100.")
 
     st.subheader("12-month scenario range")
@@ -254,8 +262,8 @@ def page_diagnostics(data: dict[str, Any]) -> None:
         st.subheader("Conformal calibration offsets")
         if offsets:
             st.write(
-                f"90% interval offset: `{offsets.get('90', float('nan')):.4f}`  |  "
-                f"50% interval offset: `{offsets.get('50', float('nan')):.4f}`"
+                f"90% interval offset: `{offsets.get('90', float('nan')):+.1%}`  |  "
+                f"50% interval offset: `{offsets.get('50', float('nan')):+.1%}`"
             )
         else:
             st.info("No offsets available.")
