@@ -1,0 +1,271 @@
+"""Tests for stockpred.backtest: threshold decision-rule backtest with
+deflated Sharpe (Task 9).
+
+Conventions mirror tests/test_conformal.py and tests/test_artifacts.py:
+small synthetic frames with hand-computed expected values, returns as
+decimal fractions.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from stockpred.backtest import run_backtest
+from stockpred.config import Config
+
+
+def _make_config(**overrides) -> Config:
+    kwargs = dict(
+        tickers=["A"],
+        fred_series=[],
+        ecb_series=[],
+        data_dir=Path("data"),
+        artifacts_dir=Path("artifacts"),
+        duckdb_path=Path("db.duckdb"),
+    )
+    kwargs.update(overrides)
+    return Config(**kwargs)
+
+
+def _row(ticker, date, q50, q05_cal, y_true, fold=0):
+    return {
+        "ticker": ticker,
+        "date": pd.Timestamp(date),
+        "q50": q50,
+        "q05_cal": q05_cal,
+        "y_true": y_true,
+        "fold": fold,
+    }
+
+
+class TestZeroCostAllPass:
+    def test_net_return_equals_equal_weight_mean(self):
+        # Every ticker passes the signal every month; zero trading costs ->
+        # net return must equal the plain equal-weight mean of y_true.
+        cfg = _make_config(
+            cost_bps=0.0,
+            cost_fixed_eur=0.0,
+            signal_threshold=-1.0,
+            loss_tolerance=-1.0,
+        )
+        rows = [
+            *[_row(t, "2020-01-31", 0.05, 0.0, y, fold=0) for t, y in [("A", 0.10), ("B", 0.02), ("C", -0.01)]],
+            *[_row(t, "2020-02-28", 0.05, 0.0, y, fold=0) for t, y in [("A", -0.03), ("B", 0.04), ("C", 0.01)]],
+        ]
+        df = pd.DataFrame(rows)
+        result = run_backtest(df, cfg)
+
+        expected_jan = np.mean([0.10, 0.02, -0.01])
+        expected_feb = np.mean([-0.03, 0.04, 0.01])
+
+        assert result["monthly_returns"][0]["ret"] == pytest.approx(expected_jan)
+        assert result["monthly_returns"][1]["ret"] == pytest.approx(expected_feb)
+        assert result["monthly_returns"][0]["gross_ret"] == pytest.approx(expected_jan)
+        assert result["monthly_returns"][0]["cost_eur"] == 0.0
+        assert result["monthly_returns"][0]["n_positions"] == 3
+
+        expected_total = (1 + expected_jan) * (1 + expected_feb) - 1
+        assert result["total_return"] == pytest.approx(expected_total)
+
+        # All tickers pass every month, so the benchmark (all tickers,
+        # equal-weight, no cost) coincides with the zero-cost portfolio.
+        assert result["benchmark_total_return"] == pytest.approx(expected_total)
+
+
+class TestCostsReduceReturn:
+    def test_net_below_gross_when_turnover_and_costs_present(self):
+        cfg = _make_config(
+            cost_bps=50.0,
+            cost_fixed_eur=5.0,
+            signal_threshold=-1.0,
+            loss_tolerance=-1.0,
+        )
+        rows = [
+            _row("A", "2020-01-31", 0.05, 0.0, 0.10, fold=0),
+            _row("B", "2020-01-31", 0.05, 0.0, 0.10, fold=0),
+        ]
+        df = pd.DataFrame(rows)
+        result = run_backtest(df, cfg)
+
+        m = result["monthly_returns"][0]
+        assert m["gross_ret"] == pytest.approx(0.10)
+        assert m["cost_eur"] > 0.0
+        assert m["ret"] < m["gross_ret"]
+
+    def test_zero_turnover_second_month_no_cost(self):
+        # Same two tickers held both months -> no entries/exits in month 2,
+        # so month 2 should carry zero cost even with nonzero cost params.
+        cfg = _make_config(
+            cost_bps=50.0,
+            cost_fixed_eur=5.0,
+            signal_threshold=-1.0,
+            loss_tolerance=-1.0,
+        )
+        rows = [
+            _row("A", "2020-01-31", 0.05, 0.0, 0.10, fold=0),
+            _row("B", "2020-01-31", 0.05, 0.0, 0.10, fold=0),
+            _row("A", "2020-02-29", 0.05, 0.0, 0.05, fold=0),
+            _row("B", "2020-02-29", 0.05, 0.0, 0.05, fold=0),
+        ]
+        df = pd.DataFrame(rows)
+        result = run_backtest(df, cfg)
+
+        m2 = result["monthly_returns"][1]
+        assert m2["cost_eur"] == 0.0
+        assert m2["ret"] == pytest.approx(m2["gross_ret"])
+
+
+class TestNoSignalMonths:
+    def test_flat_return_and_zero_cost(self):
+        cfg = _make_config(
+            cost_bps=50.0,
+            cost_fixed_eur=5.0,
+            signal_threshold=0.5,  # nothing clears this
+            loss_tolerance=-1.0,
+        )
+        rows = [
+            _row("A", "2020-01-31", 0.05, 0.0, 0.10, fold=0),
+            _row("B", "2020-01-31", 0.05, 0.0, -0.20, fold=0),
+        ]
+        df = pd.DataFrame(rows)
+        result = run_backtest(df, cfg)
+
+        m = result["monthly_returns"][0]
+        assert m["ret"] == 0.0
+        assert m["gross_ret"] == 0.0
+        assert m["cost_eur"] == 0.0
+        assert m["n_positions"] == 0
+
+    def test_loss_tolerance_filter_excludes_ticker(self):
+        # q50 clears the threshold but q05_cal is at/below loss_tolerance ->
+        # excluded from the selected set.
+        cfg = _make_config(
+            cost_bps=0.0,
+            cost_fixed_eur=0.0,
+            signal_threshold=0.01,
+            loss_tolerance=-0.10,
+        )
+        rows = [
+            _row("A", "2020-01-31", 0.05, -0.15, 0.10, fold=0),  # excluded
+            _row("B", "2020-01-31", 0.05, -0.05, 0.20, fold=0),  # included
+        ]
+        df = pd.DataFrame(rows)
+        result = run_backtest(df, cfg)
+
+        m = result["monthly_returns"][0]
+        assert m["n_positions"] == 1
+        assert m["gross_ret"] == pytest.approx(0.20)
+
+
+class TestMaxDrawdown:
+    def test_exact_on_constructed_path(self):
+        # Single ticker each month, zero cost: net returns = [0.20, -0.50].
+        # equity = [1.2, 0.6]; running max = [1.2, 1.2];
+        # drawdown = [0, -0.5] -> max_drawdown = -0.5 exactly.
+        cfg = _make_config(
+            cost_bps=0.0,
+            cost_fixed_eur=0.0,
+            signal_threshold=-1.0,
+            loss_tolerance=-1.0,
+        )
+        rows = [
+            _row("A", "2020-01-31", 0.05, 0.0, 0.20, fold=0),
+            _row("A", "2020-02-29", 0.05, 0.0, -0.50, fold=0),
+        ]
+        df = pd.DataFrame(rows)
+        result = run_backtest(df, cfg)
+
+        assert result["max_drawdown"] == pytest.approx(-0.5)
+
+
+class TestNTrades:
+    def test_counts_enters_and_exits_on_rotation(self):
+        # month1: {A, B} enter (2). month2: {B, C} -> A exits, C enters (2).
+        # month3: {A, B} -> C exits, A enters (2). Total = 6.
+        cfg = _make_config(
+            cost_bps=1.0,
+            cost_fixed_eur=0.0,
+            signal_threshold=-1.0,
+            loss_tolerance=-1.0,
+        )
+        rows = [
+            _row("A", "2020-01-31", 0.05, 0.0, 0.01, fold=0),
+            _row("B", "2020-01-31", 0.05, 0.0, 0.01, fold=0),
+            _row("B", "2020-02-29", 0.05, 0.0, 0.01, fold=0),
+            _row("C", "2020-02-29", 0.05, 0.0, 0.01, fold=0),
+            _row("A", "2020-03-31", 0.05, 0.0, 0.01, fold=0),
+            _row("B", "2020-03-31", 0.05, 0.0, 0.01, fold=0),
+        ]
+        df = pd.DataFrame(rows)
+        result = run_backtest(df, cfg)
+
+        assert result["n_trades"] == 6
+
+
+class TestOutputShapeAndSerializability:
+    def _synthetic(self, n_months=10, n_tickers=5, seed=0):
+        rng = np.random.default_rng(seed)
+        rows = []
+        months = pd.date_range("2020-01-31", periods=n_months, freq="ME")
+        for i, date in enumerate(months):
+            fold = i % 3
+            for j in range(n_tickers):
+                ticker = f"T{j}"
+                q50 = rng.normal(scale=0.05)
+                q05_cal = q50 - abs(rng.normal(scale=0.05)) - 0.01
+                y_true = rng.normal(scale=0.08)
+                rows.append(_row(ticker, date, q50, q05_cal, y_true, fold=fold))
+        return pd.DataFrame(rows)
+
+    def test_json_serializable_and_keys_present(self):
+        cfg = _make_config(n_folds=3)
+        df = self._synthetic()
+        result = run_backtest(df, cfg)
+
+        expected_keys = {
+            "monthly_returns",
+            "total_return",
+            "ann_return",
+            "ann_vol",
+            "sharpe",
+            "psr",
+            "dsr",
+            "max_drawdown",
+            "n_trades",
+            "benchmark_total_return",
+            "per_fold_sharpe",
+            "n_months",
+            "final_capital",
+        }
+        assert expected_keys.issubset(result.keys())
+
+        # Must round-trip through json with no numpy leakage.
+        serialized = json.dumps(result)
+        reloaded = json.loads(serialized)
+        assert reloaded["n_months"] == 10
+
+        for m in result["monthly_returns"]:
+            assert set(m.keys()) == {"date", "ret", "gross_ret", "n_positions", "cost_eur"}
+            assert isinstance(m["date"], str)
+            assert isinstance(m["ret"], float)
+            assert isinstance(m["n_positions"], int)
+
+        assert isinstance(result["n_trades"], int)
+        assert isinstance(result["final_capital"], float)
+        for pf in result["per_fold_sharpe"]:
+            assert set(pf.keys()) == {"fold", "sharpe"}
+            assert isinstance(pf["fold"], int)
+            assert isinstance(pf["sharpe"], float)
+
+    def test_final_capital_matches_total_return(self):
+        cfg = _make_config(n_folds=3)
+        df = self._synthetic()
+        result = run_backtest(df, cfg)
+
+        expected_final = 10000.0 * (1 + result["total_return"])
+        assert result["final_capital"] == pytest.approx(expected_final)
