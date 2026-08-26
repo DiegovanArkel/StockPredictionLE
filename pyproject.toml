@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "stockpred"
+version = "0.1.0"
+description = "Probabilistic stock forecasting system for the AEX universe."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pandas",
+    "numpy",
+    "scipy",
+    "scikit-learn",
+    "lightgbm",
+    "arch",
+    "yfinance",
+    "pandas-datareader",
+    "ecbdata",
+    "duckdb",
+    "pyarrow",
+    "pyyaml",
+    "requests",
+    "streamlit",
+    "plotly",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["stockpred"]
