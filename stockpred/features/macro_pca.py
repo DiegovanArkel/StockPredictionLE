@@ -87,10 +87,23 @@ class MacroFactorExtractor:
         self._columns = list(df.columns)
 
         n_features = len(self._columns)
-        effective_n_factors = min(self.n_factors, n_features)
+        n_rows = len(clean)
+        # sklearn's PCA requires n_components <= min(n_samples, n_features);
+        # violating that raises an opaque ValueError deep inside sklearn, so
+        # cap against both here and raise our own clear error if there's
+        # nothing left to fit (e.g. a train fold with fewer complete rows
+        # than requested factors).
+        effective_n_factors = min(self.n_factors, n_features, n_rows)
+        if effective_n_factors < 1:
+            raise ValueError(
+                f"MacroFactorExtractor.fit: cannot fit any PCA components -- "
+                f"only {n_rows} complete row(s) and {n_features} feature(s) "
+                "after dropping NaNs"
+            )
         if effective_n_factors < self.n_factors:
             warnings.warn(
-                f"n_factors={self.n_factors} exceeds n_features={n_features}; "
+                f"n_factors={self.n_factors} exceeds available rank "
+                f"(n_features={n_features}, complete_rows={n_rows}); "
                 f"capping to {effective_n_factors}",
                 UserWarning,
                 stacklevel=2,

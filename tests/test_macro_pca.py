@@ -213,6 +213,33 @@ def test_n_factors_capped_when_exceeding_n_features():
     assert list(factors.columns) == ["F1", "F2", "F3"]
 
 
+def test_n_factors_capped_when_fewer_complete_rows_than_n_factors():
+    """A train fold can have more feature columns than complete (no-NaN)
+    rows -- sklearn's PCA raises an opaque ValueError if n_components
+    exceeds min(n_samples, n_features), so this must be capped (with a
+    warning) the same way an n_features shortfall is."""
+    wide = _rank3_synthetic_wide(10, n_cols=8)
+    sparse = wide.copy()
+    sparse.iloc[2:, 0] = np.nan  # only rows 0,1 remain complete-case
+
+    extractor = MacroFactorExtractor(n_factors=5)
+    with pytest.warns(UserWarning):
+        extractor.fit(sparse)
+
+    factors = extractor.transform(wide)
+    assert list(factors.columns) == ["F1", "F2"]
+
+
+def test_fit_raises_clear_error_when_no_rows_survive_dropna():
+    wide = _rank3_synthetic_wide(5, n_cols=4)
+    all_nan_one_col = wide.copy()
+    all_nan_one_col.iloc[:, 0] = np.nan  # every row now has a NaN
+
+    extractor = MacroFactorExtractor(n_factors=3)
+    with pytest.raises(ValueError, match="complete"):
+        extractor.fit(all_nan_one_col)
+
+
 def test_fit_drops_nan_rows_before_fitting():
     wide = _rank3_synthetic_wide(50)
     wide_with_nan = wide.copy()

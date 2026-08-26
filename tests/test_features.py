@@ -449,3 +449,89 @@ def test_beta_12m_uses_only_data_up_to_t_no_lookahead():
     a_beta_later = panel_a.iloc[later_idx]["beta_12m"]
     b_beta_later = panel_b.iloc[later_idx]["beta_12m"]
     assert a_beta_later != pytest.approx(b_beta_later, abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Mid-series calendar gap (regression: a missing month must never make
+# row-position-based rolling/shift silently span the wrong calendar window)
+# ---------------------------------------------------------------------------
+
+
+def test_build_monthly_panel_handles_mid_series_gap_month():
+    """A ticker with an entire missing calendar month (e.g. no trading data
+    for May at all) must not let neighboring months' features/target be
+    computed as if the gap month didn't exist.
+
+    Regression for: April's fwd_ret_1m silently becoming June's return
+    (wrong horizon, no NaN) and June's mom_3m silently spanning
+    Mar+Apr+Jun instead of the true Apr+May+Jun calendar window.
+    """
+    ticker = "GAP"
+    jan, feb, mar, apr, may, jun, jul = _month_end_dates(7)
+
+    rows: list[dict] = []
+    level = 100.0
+
+    def add_month(month_end: pd.Timestamp, month_ret: float, is_first: bool = False) -> None:
+        nonlocal level
+        target_level = level * (1.0 + month_ret)
+        g = (target_level / level) ** (1.0 / DAYS_PER_MONTH) - 1.0
+        dates = pd.bdate_range(end=month_end, periods=DAYS_PER_MONTH)
+        for day_idx, d in enumerate(dates, start=1):
+            if not (is_first and day_idx == 1):
+                level = level * (1.0 + g)
+            rows.append({"date": d, "close": level, "adj_close": level, "volume": 1_000.0})
+        rows[-1]["close"] = target_level
+        rows[-1]["adj_close"] = target_level
+        level = target_level
+
+    add_month(jan, 0.0, is_first=True)
+    add_month(feb, 0.01)
+    add_month(mar, 0.01)
+    add_month(apr, 0.01)
+    # May: NO trading data at all -- the gap.
+    add_month(jun, -0.50)
+    add_month(jul, 0.02)
+
+    prices = pd.DataFrame(rows)
+    prices["ticker"] = ticker
+    prices = prices[["date", "ticker", "close", "adj_close", "volume"]]
+    factors = _make_factors(7, [0.0] * 7)
+
+    # --- internal pipeline (pre target-drop), to directly check the values
+    # the reviewer's regression names: fwd_ret_1m and mom_3m around the gap.
+    daily = stock._prepare_daily(prices)
+    ticker_daily = daily[daily["ticker"] == ticker].sort_values("date")
+    monthly = stock._monthly_aggregate(ticker_daily)
+    monthly = stock._reindex_full_calendar(monthly)
+    monthly = stock._finalize_price_derived_columns(monthly)
+    monthly = stock._add_momentum(monthly)
+    monthly["fwd_ret_1m"] = monthly["ret_1m"].shift(-1)
+
+    # May must exist as an explicit (NaN) row internally, so the rolling
+    # windows around it stay calendar-aligned.
+    assert may in set(monthly["date"])
+
+    # (a) April's fwd_ret_1m must be NaN -- NOT June's -50% return.
+    apr_row = monthly[monthly["date"] == apr].iloc[0]
+    assert pd.isna(apr_row["fwd_ret_1m"])
+
+    # June's own ret_1m (relative to the unknown May price) is NaN.
+    jun_row = monthly[monthly["date"] == jun].iloc[0]
+    assert pd.isna(jun_row["ret_1m"])
+
+    # (b) June's mom_3m (true window Apr, May, Jun) must be NaN -- never
+    # silently compressed into a Mar+Apr+Jun product.
+    assert pd.isna(jun_row["mom_3m"])
+
+    # --- public API: the phantom May row never appears in the output, and
+    # April -- whose true target (May's return) is unknown -- is correctly
+    # dropped rather than kept with a wrong-horizon target.
+    panel = stock.build_monthly_panel(prices, factors).sort_values("date").reset_index(drop=True)
+    assert may not in set(panel["date"])
+    assert apr not in set(panel["date"])
+
+    # June is a real trading month (has its own price data) and survives,
+    # with a well-defined, correctly-computed forward target from July.
+    jun_panel_row = panel[panel["date"] == jun].iloc[0]
+    assert jun_panel_row["fwd_ret_1m"] == pytest.approx(0.02, abs=1e-9)

@@ -77,6 +77,8 @@ def build_monthly_panel(prices: pd.DataFrame, factors: pd.DataFrame) -> pd.DataF
     for ticker, ticker_daily in daily.groupby("ticker", sort=False):
         ticker_daily = ticker_daily.sort_values("date")
         monthly = _monthly_aggregate(ticker_daily)
+        monthly = _reindex_full_calendar(monthly)
+        monthly = _finalize_price_derived_columns(monthly)
         monthly = _add_momentum(monthly)
         monthly = _add_volatility(monthly)
         monthly = _add_beta(monthly, mkt_rf)
@@ -85,6 +87,12 @@ def build_monthly_panel(prices: pd.DataFrame, factors: pd.DataFrame) -> pd.DataF
         ticker_frames.append(monthly)
 
     panel = pd.concat(ticker_frames, ignore_index=True)
+    # Drop calendar months that were inserted by _reindex_full_calendar
+    # because the ticker had NO real trading data that month (a "phantom"
+    # row) -- they exist only so row-position-based rolling/shift above
+    # stays aligned to the true calendar across the gap; they were never
+    # real (ticker, month) observations themselves.
+    panel = panel[panel["had_data"]]
     panel = panel.dropna(subset=["fwd_ret_1m"])
     panel = panel[_OUTPUT_COLUMNS].reset_index(drop=True)
     return panel
@@ -102,9 +110,10 @@ def _prepare_daily(prices: pd.DataFrame) -> pd.DataFrame:
 
 
 def _monthly_aggregate(ticker_daily: pd.DataFrame) -> pd.DataFrame:
-    """Collapse one ticker's daily rows to one row per month end, keeping the
-    pooled sum/sum-of-squares/count of daily returns needed for exact
-    rolling-window volatility later."""
+    """Collapse one ticker's daily rows to one row per REAL trading month
+    (months with zero trading days simply have no row here yet -- see
+    `_reindex_full_calendar`), keeping the pooled sum/sum-of-squares/count
+    of daily returns needed for exact rolling-window volatility later."""
     monthly = (
         ticker_daily.groupby("month_end")
         .agg(
@@ -120,7 +129,37 @@ def _monthly_aggregate(ticker_daily: pd.DataFrame) -> pd.DataFrame:
         .sort_values("date")
         .reset_index(drop=True)
     )
+    return monthly
 
+
+def _reindex_full_calendar(monthly: pd.DataFrame) -> pd.DataFrame:
+    """Reindex a per-ticker monthly frame onto the full month-end calendar
+    between its min and max date, inserting an explicit all-NaN row for any
+    calendar month with no real trading data.
+
+    Without this, every rolling/shift operation downstream (momentum, vol,
+    beta, and the fwd_ret_1m target) is row-POSITION-based and would
+    silently treat two months that are actually N calendar months apart as
+    adjacent across a data gap -- e.g. assigning April's target the return
+    of June (skipping a missing May) instead of NaN. Reindexing makes every
+    row correspond to exactly one calendar month, gap or not, so those
+    operations are naturally calendar-correct; `had_data` marks which rows
+    are real observations (phantom gap rows are dropped from the final
+    panel by the caller, but must stay present through the rolling/shift
+    steps so neighboring real months see the gap).
+    """
+    full_range = pd.date_range(monthly["date"].min(), monthly["date"].max(), freq="ME")
+    reindexed = (
+        monthly.set_index("date").reindex(full_range).rename_axis("date").reset_index()
+    )
+    reindexed["had_data"] = reindexed["ret_count"].notna()
+    return reindexed
+
+
+def _finalize_price_derived_columns(monthly: pd.DataFrame) -> pd.DataFrame:
+    """Derive ret_1m/dollar_vol/amihud AFTER calendar reindexing, so ret_1m's
+    pct_change() correctly yields NaN across a gap instead of silently
+    compounding the return over the missing month(s)."""
     monthly["ret_1m"] = monthly["adj_close_last"].pct_change()
     monthly["dollar_vol"] = np.log(monthly["dollar_vol_mean"])
     monthly["amihud"] = np.log1p(_AMIHUD_SCALE * monthly["amihud_mean"])
