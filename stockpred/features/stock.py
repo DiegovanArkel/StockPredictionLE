@@ -53,7 +53,9 @@ _OUTPUT_COLUMNS = [
 ]
 
 
-def build_monthly_panel(prices: pd.DataFrame, factors: pd.DataFrame) -> pd.DataFrame:
+def build_monthly_panel(
+    prices: pd.DataFrame, factors: pd.DataFrame, drop_missing_target: bool = True
+) -> pd.DataFrame:
     """Build the monthly stock feature panel.
 
     Parameters
@@ -62,13 +64,22 @@ def build_monthly_panel(prices: pd.DataFrame, factors: pd.DataFrame) -> pd.DataF
         Tidy daily frame ``[date, ticker, close, adj_close, volume]``.
     factors:
         Tidy monthly (month-end) frame including ``mkt_rf`` (Fama-French).
+    drop_missing_target:
+        When ``True`` (the default, and what every training/evaluation
+        caller wants), rows with a missing ``fwd_ret_1m`` target -- always
+        exactly the most recent real trading month per ticker, whose next
+        month hasn't happened yet -- are dropped. Pass ``False`` to keep
+        those rows too; the pipeline's production-forecast step uses this
+        to obtain feature rows for the latest available month per ticker,
+        which by construction has no known target yet.
 
     Returns
     -------
     A tidy, reset-index frame with one row per (ticker, month-end date):
     ``ret_1m``, the feature columns listed in the task brief, and the
     ``fwd_ret_1m`` target (``ret_1m`` shifted -1 within ticker). Rows with a
-    missing target are dropped; feature NaNs are kept.
+    missing target are dropped unless ``drop_missing_target=False``; feature
+    NaNs are always kept.
     """
     daily = _prepare_daily(prices)
     mkt_rf = factors.set_index("date")["mkt_rf"]
@@ -93,7 +104,8 @@ def build_monthly_panel(prices: pd.DataFrame, factors: pd.DataFrame) -> pd.DataF
     # stays aligned to the true calendar across the gap; they were never
     # real (ticker, month) observations themselves.
     panel = panel[panel["had_data"]]
-    panel = panel.dropna(subset=["fwd_ret_1m"])
+    if drop_missing_target:
+        panel = panel.dropna(subset=["fwd_ret_1m"])
     panel = panel[_OUTPUT_COLUMNS].reset_index(drop=True)
     return panel
 

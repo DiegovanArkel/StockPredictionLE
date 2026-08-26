@@ -274,6 +274,34 @@ def test_fwd_ret_1m_drops_last_month_per_ticker():
     assert panel["fwd_ret_1m"].isna().sum() == 0
 
 
+def test_drop_missing_target_false_keeps_last_month_row():
+    """`drop_missing_target=False` is used by the production-forecast step
+    of the pipeline (Task 10) to obtain feature rows for the latest
+    available month per ticker, whose target isn't known yet."""
+    returns = [0.05, -0.02, 0.03]
+    prices = _make_ticker_prices("AAA", returns)
+    n_months = 1 + len(returns)
+    factors = _make_factors(n_months, [0.0] * n_months)
+
+    panel_default = stock.build_monthly_panel(prices, factors)
+    panel_full = stock.build_monthly_panel(prices, factors, drop_missing_target=False)
+
+    last_month = prices["date"].max() + pd.offsets.MonthEnd(0)
+    assert last_month not in set(panel_default["date"])
+    assert last_month in set(panel_full["date"])
+
+    last_row = panel_full[panel_full["date"] == last_month].iloc[0]
+    assert pd.isna(last_row["fwd_ret_1m"])
+
+    # Every other row is unaffected: panel_full is panel_default plus
+    # exactly the one dropped last-month row per ticker.
+    assert len(panel_full) == len(panel_default) + 1
+    non_last = panel_full[panel_full["date"] != last_month]
+    pd.testing.assert_frame_equal(
+        non_last.reset_index(drop=True), panel_default.reset_index(drop=True)
+    )
+
+
 def test_fwd_ret_1m_no_cross_ticker_leakage():
     """Ticker A's target must come from ticker A's own next month, never B's."""
     returns_a = [0.05, -0.02, 0.03, 0.10]
