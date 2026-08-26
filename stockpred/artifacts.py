@@ -88,7 +88,15 @@ def assemble_forecasts(
     Each of the three quantile families (``q*``, ``ens_q*``, ``y_q*``) is
     sorted to be non-decreasing within a row -- guarding against crossing
     that could in principle arise from averaging two independently
-    estimated quantile curves.
+    estimated quantile curves, or from a disordered raw GARCH simulation
+    quantile. The ``ens_q*`` family is sorted *before* it is used as the
+    yearly recentering target, and the yearly anchor point is the true
+    median-by-value of the raw GARCH year quantiles (not whatever landed in
+    the ``y_q50``-labeled column) -- both a disordered ``ens_q*`` and a
+    disordered raw ``y_q*`` would otherwise silently break the
+    ``y_q50 == 12 * ens_q50`` guarantee. That guarantee holds exactly,
+    post-assembly, for every row (see the regression test using disordered
+    raw GARCH month/year quantiles).
     """
     merged = final_pred.merge(garch_df, on="ticker", how="outer", suffixes=("", "_garch"))
 
@@ -122,17 +130,38 @@ def assemble_forecasts(
     out["ens_q75"] = _ensemble("q75", "m_q75")
     out["ens_q95"] = _ensemble("q95", "m_q95")
 
-    # Yearly bands: GARCH year quantiles, re-centered so the median equals
-    # 12 * ens_q50. Missing GARCH (NaN inputs) propagate to NaN outputs
+    # Sort the monthly + ensemble families *before* using ens_q50 as the
+    # yearly recentering target. Averaging two independently estimated
+    # quantile curves position-by-position (or a disordered raw GARCH
+    # month quantile) can leave ens_q* disordered; the value the dashboard
+    # displays as "the median" is the post-sort middle element, which is
+    # not necessarily what landed in the ens_q50-labeled column pre-sort.
+    _sort_family(out, _MONTHLY_FAMILY)
+    _sort_family(out, _ENS_FAMILY)
+
+    # Yearly bands: GARCH year quantiles, re-centered so the (displayed,
+    # post-sort) median equals 12 * ens_q50. The anchor point subtracted
+    # off is the true median-by-value of the raw GARCH year quantiles --
+    # i.e. sort the five raw values and take the middle one -- rather than
+    # whatever landed in the y_q50-labeled column, since GARCH's simulated
+    # quantiles can themselves arrive disordered. Adding one scalar offset
+    # to the already-sorted raw values keeps them sorted, so the family is
+    # monotone by construction; the trailing _sort_family call is only a
+    # defensive no-op. Missing GARCH (NaN inputs) propagate to NaN outputs
     # automatically -- no special-casing needed.
     target_median = 12.0 * out["ens_q50"].to_numpy(dtype=float)
-    y_q50_raw = merged["y_q50"].to_numpy(dtype=float) if "y_q50" in merged.columns else np.full(len(merged), np.nan)
-    recenter = target_median - y_q50_raw
-    for suffix in _QUANTILE_SUFFIXES:
-        col = f"y_{suffix}"
-        if col in merged.columns:
-            out[col] = merged[col].to_numpy(dtype=float) + recenter
-        else:
+
+    y_cols = [f"y_{s}" for s in _QUANTILE_SUFFIXES]
+    if all(col in merged.columns for col in y_cols):
+        y_raw = merged[y_cols].to_numpy(dtype=float)
+        y_sorted = np.sort(y_raw, axis=1)
+        true_median = y_sorted[:, 2]
+        recenter = target_median - true_median
+        y_final = y_sorted + recenter[:, None]
+        for i, col in enumerate(y_cols):
+            out[col] = y_final[:, i]
+    else:
+        for col in y_cols:
             out[col] = np.nan
 
     out["ann_vol"] = merged["ann_vol"] if "ann_vol" in merged.columns else np.nan
@@ -142,9 +171,7 @@ def assemble_forecasts(
     else:
         out["garch_converged"] = False
 
-    _sort_family(out, _MONTHLY_FAMILY)
-    _sort_family(out, _ENS_FAMILY)
-    _sort_family(out, _YEARLY_FAMILY)
+    _sort_family(out, _YEARLY_FAMILY)  # defensive no-op; already sorted by construction
 
     return out.sort_values("ticker").reset_index(drop=True)
 

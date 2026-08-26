@@ -174,6 +174,87 @@ class TestAssembleForecasts:
         np.testing.assert_allclose(ens_vals, raw_ens)
 
 
+class TestYearlyRecenterUsesPostSortMedian:
+    """Regression test for a bug where the yearly recentering anchor was
+    computed from pre-sort/label values instead of the *displayed*
+    (post-sort) ens_q50 and the raw y quantiles' *true* median-by-value.
+
+    A disordered raw GARCH month quantile forces the ens_q* family's sort
+    to move ens_q50 away from its pre-sort labeled value; a disordered raw
+    GARCH year quantile means the y_q50-labeled value isn't the true
+    median of the five raw year quantiles either. Both must be resolved
+    post-sort/by-value for ``y_q50 == 12 * ens_q50`` to hold exactly.
+    """
+
+    def _final_pred(self) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "ticker": ["DDD"],
+                "q05": [-0.10],
+                "q25": [-0.03],
+                "q50": [0.01],
+                "q75": [0.05],
+                "q95": [0.12],
+                "q05_cal": [-0.11],
+                "q25_cal": [-0.035],
+                "q75_cal": [0.055],
+                "q95_cal": [0.13],
+            }
+        )
+
+    def _garch_df(self) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "ticker": ["DDD"],
+                "ann_vol": [0.20],
+                # m_q50 is a wild outlier relative to the other month
+                # quantiles: the pre-sort ens_q50-labeled value (mean of
+                # q50=0.01 and m_q50=50.0 -> 25.005) is nowhere near the
+                # ensemble family's true (post-sort) median of 0.05.
+                "m_q05": [-0.09],
+                "m_q25": [-0.02],
+                "m_q50": [50.0],
+                "m_q75": [0.045],
+                "m_q95": [0.10],
+                # Raw year quantiles disordered: the y_q50-labeled value
+                # (-100.0) is a deep outlier, not the true median (0.6).
+                "y_q05": [0.5],
+                "y_q25": [0.6],
+                "y_q50": [-100.0],
+                "y_q75": [0.7],
+                "y_q95": [0.8],
+                "converged": [True],
+            }
+        )
+
+    def test_y_q50_equals_twelve_times_displayed_ens_q50(self):
+        out = assemble_forecasts(
+            self._final_pred(), self._garch_df(), offsets={}, as_of="2026-08-26"
+        ).iloc[0]
+
+        # Sorting the raw ensemble means [-0.10, -0.0275, 25.005, 0.05,
+        # 0.115] gives a true median of 0.05 -- not the pre-sort labeled
+        # 25.005.
+        assert out["ens_q50"] == pytest.approx(0.05)
+        assert out["y_q50"] == pytest.approx(12.0 * out["ens_q50"])
+        assert out["y_q50"] == pytest.approx(0.6)
+
+    def test_monotonicity_holds_on_all_three_families(self):
+        out = assemble_forecasts(
+            self._final_pred(), self._garch_df(), offsets={}, as_of="2026-08-26"
+        ).iloc[0]
+
+        q_vals = out[["q05", "q25", "q50", "q75", "q95"]].to_numpy(dtype=float)
+        ens_vals = out[["ens_q05", "ens_q25", "ens_q50", "ens_q75", "ens_q95"]].to_numpy(dtype=float)
+        y_vals = out[["y_q05", "y_q25", "y_q50", "y_q75", "y_q95"]].to_numpy(dtype=float)
+
+        assert np.all(np.diff(q_vals) >= -1e-12)
+        assert np.all(np.diff(ens_vals) >= -1e-12)
+        assert np.all(np.diff(y_vals) >= -1e-12)
+
+        np.testing.assert_allclose(y_vals, [-100.0, 0.5, 0.6, 0.7, 0.8])
+
+
 def _wf_metrics() -> dict:
     return {
         "pinball_q50": np.float64(0.0123),
