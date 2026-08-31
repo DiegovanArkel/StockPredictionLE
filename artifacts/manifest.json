@@ -1,9 +1,13 @@
 {
-  "generated_at": "2026-08-26T23:24:26.815449+00:00",
+  "generated_at": "2026-08-31T13:10:17.339381+00:00",
   "n_forecasts": 24,
-  "n_history_rows": 2146,
+  "n_history_rows": 2150,
   "failed_tickers": [],
-  "stale_sources": {},
+  "stale_sources": {
+    "prices": false,
+    "macro": false,
+    "factors": false
+  },
   "versions": {
     "pandas": "3.0.5",
     "lightgbm": "4.7.0",
